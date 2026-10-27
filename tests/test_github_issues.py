@@ -141,6 +141,28 @@ class GithubIssuesTest(IssuesTestCase):
         self.assertIn("no GitHub remote", result["skipped"][0]["reason"])
         self.assertEqual(self.calls(), [])
 
+    def test_create_all_covers_every_task_once(self):
+        other = self.tasks["Audit lib/src"]["id"]
+        self.add_findings([{**FINDING, "title": "Another"}], [], task_id=other)
+        plan = github_issues.preview_all(self.conn)
+        self.assertEqual((plan["ready"], plan["blocked"]), (3, 0))
+        self.assertEqual({i["task_id"] for i in plan["issues"]}, {self.task_id, other})
+        self.assertEqual(self.calls(), [], "the preview creates nothing")
+
+        result = github_issues.create_all(self.conn, log=lambda m: None)
+        self.assertEqual(len(result["created"]), 3)
+        self.assertEqual(github_issues.tasks_missing_issues(self.conn), [])
+        self.assertEqual(github_issues.preview_all(self.conn)["ready"], 0)
+        again = github_issues.create_all(self.conn, log=lambda m: None)
+        self.assertEqual(again["created"], [])
+        self.assertEqual(len([c for c in self.calls() if c["args"][:2] == ["issue", "create"]]), 3)
+
+    def test_create_all_reports_a_failing_task_and_goes_on(self):
+        with mock.patch.dict(os.environ, {"FAKE_GH_FAIL": "1"}):
+            result = github_issues.create_all(self.conn, log=lambda m: None)
+        self.assertEqual(result["created"], [])
+        self.assertEqual(result["errors"][0]["task_id"], self.task_id)
+
     def test_only_the_chosen_findings_are_created(self):
         finding = next(f for f in store.list_findings(self.conn, task_id=self.task_id) if f["kind"] == "finding")
         result = github_issues.create(self.conn, self.task_id, [finding["id"]], log=lambda m: None)
@@ -168,6 +190,15 @@ class IssuesPageTest(IssuesTestCase):
         self.assertEqual(len(json.loads(data)["created"]), 2)
         detail = json.loads(self.request("GET", f"/api/tasks/{self.task_id}")[1])
         self.assertTrue(all(f["issue_url"] for f in detail["findings"]))
+
+    def test_create_all_from_the_page(self):
+        plan = json.loads(self.request("GET", "/api/issues")[1])
+        self.assertEqual(plan["ready"], 2)
+        status, data = self.post("/api/issues", {})
+        self.assertEqual(status, 200, data)
+        body = json.loads(data)
+        self.assertEqual((len(body["created"]), body["preview"]["ready"]), (2, 0))
+        self.assertIn(b'id="issues-all"', self.request("GET", "/")[1])
 
     def test_gh_errors_are_reported(self):
         with mock.patch.dict(os.environ, {"FAKE_GH_FAIL": "1"}):

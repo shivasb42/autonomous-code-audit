@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from audit_agent import planning, review, store, web
+from audit_agent import planning, review, store, views, web
 from audit_agent.inventory import discover
 from audit_agent.repo import open_repository
 from tests.helpers import make_repo
@@ -75,6 +75,42 @@ class ReviewTest(ReviewTestCase):
         found = {t["title"] for t in review.find_tasks(self.conn, self.audit_id, review.TaskFilter(search="BUTTON.dart"))}
         self.assertEqual(found, {"Audit lib/src/widgets"})
 
+    def add_api_task(self, paths, status="done"):
+        task_id = self.conn.execute(
+            """INSERT INTO audit_tasks (audit_id, title, line_count, priority, priority_reason, status, created_at,
+                                        updated_at, kind, task_key)
+               VALUES (?, 'GET /me', 1, 1, 'r', ?, 't', 't', 'api', ?)""",
+            (self.audit_id, status, f"key-{len(paths)}-{status}"),
+        ).lastrowid
+        self.conn.executemany("INSERT INTO api_task_files (task_id, audit_id, path, role) VALUES (?, ?, ?, 'handler')",
+                              [(task_id, self.audit_id, p) for p in paths])
+        self.conn.commit()
+        return task_id
+
+    def test_file_tasks_show_what_finished_api_tasks_already_looked_at(self):
+        lib = self.tasks["Audit lib"]
+        first = lib["files"][0]
+        api_task = self.add_api_task([first])
+        self.add_api_task(lib["files"], status="pending")
+        found = {t["title"]: t for t in review.find_tasks(self.conn, self.audit_id)}
+        self.assertEqual((found["Audit lib"]["api_covered"], found["Audit lib"]["api_task_ids"]), (1, [api_task]),
+                         "only finished API tasks count")
+        self.assertEqual(found["Audit test"]["api_covered"], 0)
+
+        def titles(api):
+            return {t["title"] for t in review.find_tasks(self.conn, self.audit_id, review.TaskFilter(api=api))}
+        some = "some" if len(lib["files"]) > 1 else "all"
+        self.assertEqual(titles(some), {"Audit lib"})
+        self.assertNotIn("Audit lib", titles("none"))
+        self.assertIn("Audit test", titles("none"))
+        self.assertTrue(all(t["kind"] == "files" for t in review.find_tasks(
+            self.conn, self.audit_id, review.TaskFilter(api="none"))), "the filter shows file groups only")
+
+        seen = views.task_detail(self.conn, lib["id"])["api_seen"]
+        self.assertEqual(seen["files"], [{"path": first, "api_tasks": [{"id": api_task, "title": "GET /me", "repo": "repo"}]}])
+        self.assertEqual(seen["total_files"], len(lib["files"]))
+        self.assertEqual(seen["findings"], [])
+
     def test_planning_again_keeps_cancellations(self):
         review.cancel_matching(self.conn, self.audit_id, review.TaskFilter(tests="only"))
         _, created = planning.plan_audit(self.conn, self.audit_id)
@@ -84,7 +120,11 @@ class ReviewTest(ReviewTestCase):
     def test_version_3_database_is_upgraded_without_losing_tasks(self):
         old_path = self.base / "v3.db"
         v3_schema = (
-            store.SCHEMA.replace(store.BATCH_ROUND_TABLES, "")
+            store.SCHEMA.replace(store.DUPLICATE_TABLES, "")
+            .replace(store.FIX_COMMENT_TABLES, "")
+            .replace(store.FIX_TABLES, "")
+            .replace(store.VERIFICATION_TABLES, "")
+            .replace(store.BATCH_ROUND_TABLES, "")
             .replace(store.ISSUE_TABLES, "")
             .replace(store.BATCH_TABLES, "")
             .replace(store.API_TASK_TABLES, "")
@@ -157,6 +197,15 @@ class ReviewPageTest(ReviewTestCase):
         status, data = self.request("GET", f"/api/tasks/{self.tasks['Audit lib']['id']}")
         detail = json.loads(data)
         self.assertEqual([e["path"] for e in detail["entry_points"]], ["lib/main.dart"])
+        self.assertEqual(detail["api_seen"]["files"], [])
+
+        status, data = self.request("GET", f"/api/audits/{self.audit_id}/tasks?api=none")
+        self.assertEqual(status, 200)
+        listed = json.loads(data)["tasks"]
+        self.assertEqual(len(listed), len(self.tasks))
+        self.assertEqual({t["api_covered"] for t in listed}, {0})
+        self.assertEqual(self.request("GET", f"/api/audits/{self.audit_id}/tasks?api=bogus")[0], 400)
+        self.assertIn(b'id="api-seen"', page)
 
     def test_cancel_and_restore_through_the_page(self):
         task_id = self.tasks["Audit lib/src"]["id"]

@@ -180,7 +180,9 @@ def build_request(conn: sqlite3.Connection, task_id: int, model: str, round_no: 
         "max_tokens": api_runner.MAX_OUTPUT_TOKENS,
         "system": SYSTEM_PROMPT,
         "tools": [_submit_tool()],
-        "tool_choice": {"type": "tool", "name": "submit_report"},
+        # Forcing a specific tool ("tool" or "any") isn't supported by every model, so Claude is told
+        # to call submit_report and an answer written as JSON text is accepted too (see _result).
+        "tool_choice": {"type": "auto"},
         "messages": [{"role": "user", "content": prompt}],
     }
     return f"task-{task_id}-{secrets.token_hex(4)}", params
@@ -274,6 +276,12 @@ def _result(message: dict, model: str) -> investigation.AgentResult:
     report = next((b.get("input") for b in message.get("content") or []
                    if b.get("type") == "tool_use" and b.get("name") == "submit_report"), None)
     if not isinstance(report, dict):
+        text = "\n".join(b.get("text", "") for b in message.get("content") or [] if b.get("type") == "text")
+        try:
+            report = investigation._extract_report({"result": text}) if text.strip() else None
+        except investigation.InvestigationError:
+            report = None
+    if not isinstance(report, dict) or not {"findings", "needs_review"} & set(report):
         raise investigation.InvestigationError(
             f"Claude's batch answer had no report (stop reason: {message.get('stop_reason')})."
         )

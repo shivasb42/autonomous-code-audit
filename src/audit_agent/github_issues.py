@@ -147,12 +147,53 @@ def preview(conn: sqlite3.Connection, task_id: int) -> dict:
     repos: dict[int, str | None] = {}
     issues = []
     for finding in store.list_findings(conn, task_id=task_id):
+        if finding["duplicate_of"]:
+            continue
         file_audit_id = finding["file_audit_id"] or finding["audit_id"]
         file_audit = store.get_audit(conn, file_audit_id)
         if file_audit_id not in repos:
             repos[file_audit_id] = github_repo(file_audit["repo_path"])
         issues.append(_issue(finding, task, file_audit, repos[file_audit_id]))
     return {"task_id": task_id, "board": board_title(conn, task["audit_id"]), "issues": issues}
+
+
+def tasks_missing_issues(conn: sqlite3.Connection) -> list[int]:
+    """Tasks with at least one finding or review item that has no GitHub issue yet."""
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT task_id FROM findings WHERE issue_url IS NULL AND duplicate_of IS NULL ORDER BY task_id"
+    )]
+
+
+def preview_all(conn: sqlite3.Connection) -> dict:
+    """Every issue that `create_all` would create, across all tasks, without creating anything."""
+    issues, boards = [], set()
+    for task_id in tasks_missing_issues(conn):
+        plan = preview(conn, task_id)
+        boards.add(plan["board"])
+        issues += [{**i, "task_id": task_id} for i in plan["issues"] if not i["issue_url"]]
+    return {"issues": issues, "boards": sorted(boards),
+            "ready": sum(1 for i in issues if not i["problem"]),
+            "blocked": sum(1 for i in issues if i["problem"])}
+
+
+def create_all(conn: sqlite3.Connection, log=print) -> dict:
+    """Create the missing issues for every task. A task that fails is reported and the rest go on."""
+    result = {"created": [], "skipped": [], "warnings": [], "errors": [], "boards": []}
+    for task_id in tasks_missing_issues(conn):
+        try:
+            done = create(conn, task_id, log=log)
+        except IssueError as exc:
+            result["errors"].append({"task_id": task_id, "error": str(exc)})
+            log(f"Issues for task #{task_id} failed: {exc}")
+            if str(exc).startswith(("gh auth status failed", "The `gh` command was not found")):
+                break
+            continue
+        result["created"] += [{**c, "task_id": task_id} for c in done["created"]]
+        result["skipped"] += [{**s, "task_id": task_id} for s in done["skipped"]]
+        result["warnings"] += done["warnings"]
+        if done["board"] and done["board"]["title"] not in [b["title"] for b in result["boards"]]:
+            result["boards"].append(done["board"])
+    return result
 
 
 def _board(title: str) -> dict:

@@ -9,7 +9,8 @@ import os
 import sys
 from pathlib import Path
 
-from audit_agent import api_map, api_tasks, batches, credentials, github_issues, planning, store, views, web
+from audit_agent import (api_map, api_tasks, batches, credentials, github_issues, planning, pull_requests, reproduce,
+                         sandbox, store, views, web)
 from audit_agent import investigate as investigation
 from audit_agent.inventory import discover
 from audit_agent.inventory.apps import APP_TYPES
@@ -69,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     apps.add_argument("--json", action="store_true", help="print JSON instead of text")
 
     app_type = commands.add_parser("app-type", parents=[common], help="correct an app's type; kept for later audits")
-    app_type.add_argument("app", help="app name (e.g. football_fantasy/client) or folder path")
+    app_type.add_argument("app", help="app name (e.g. shop/client) or folder path")
     app_type.add_argument("type", choices=APP_TYPES)
 
     map_api = commands.add_parser("map-api", parents=[common], help="match frontend API calls to backend routes in a project")
@@ -109,8 +110,44 @@ def _parser() -> argparse.ArgumentParser:
 
     issues = commands.add_parser("issues", parents=[common],
                                  help="preview (or, with --create, create) GitHub issues for a task's findings")
-    issues.add_argument("task_id", type=int)
+    issues.add_argument("task_id", type=int, nargs="?")
+    issues.add_argument("--all", action="store_true", help="every finding that has no issue yet, across all tasks")
     issues.add_argument("--create", action="store_true", help="create the issues and add them to the project board")
+
+    reproduce_cmd = commands.add_parser(
+        "reproduce", parents=[common],
+        help="send one finding to an independent Claude verifier that tries to reproduce it with a test",
+    )
+    reproduce_cmd.add_argument("finding_id", type=int)
+    reproduce_cmd.add_argument("--model", help="Claude model name (default: the API runner's default)")
+    reproduce_cmd.add_argument("--max-turns", type=int, default=reproduce.DEFAULT_MAX_TURNS,
+                               help=f"limit on verifier turns (default: {reproduce.DEFAULT_MAX_TURNS})")
+    reproduce_cmd.add_argument("--max-cost-usd", type=float, default=reproduce.DEFAULT_MAX_COST_USD,
+                               help=f"stop once the estimated cost reaches this (default: {reproduce.DEFAULT_MAX_COST_USD})")
+    reproduce_cmd.add_argument("--show-prompt", action="store_true", help="print the prompt and exit without running Claude")
+
+    setup_check = commands.add_parser(
+        "reproduce-setup", parents=[common],
+        help="prepare an audit's test copy and run one existing test in it with the network off (no Claude)",
+    )
+    setup_check.add_argument("audit_id", type=int)
+
+    verifications = commands.add_parser("verifications", parents=[common], help="list attempts to reproduce findings")
+    verifications.add_argument("--finding", type=int, help="only this finding")
+    verifications.add_argument("--audit", type=int, help="only findings of this audit")
+    verifications.add_argument("--id", type=int, help="show one attempt with its test and output")
+
+    prs = commands.add_parser(
+        "prs", parents=[common],
+        help="preview (or, with --open, open) a draft pull request for every checked fix that has none yet",
+    )
+    prs.add_argument("--open", action="store_true", help="push the branches and open the draft pull requests")
+
+    fix_comments = commands.add_parser(
+        "fix-comments", parents=[common],
+        help="preview (or, with --post, post) the issue comments still missing for Reproduce + fix attempts",
+    )
+    fix_comments.add_argument("--post", action="store_true", help="post them on GitHub")
 
     findings = commands.add_parser("findings", parents=[common], help="list findings for an audit or a task")
     findings.add_argument("audit_id", type=int, nargs="?")
@@ -362,6 +399,26 @@ def _batch_cancel(args: argparse.Namespace, conn) -> int:
 
 
 def _issues(args: argparse.Namespace, conn) -> int:
+    if args.all:
+        if args.create:
+            result = github_issues.create_all(conn)
+            print(f"Created {len(result['created'])} issue(s).")
+            for item in result["skipped"]:
+                print(f"Skipped finding #{item['finding_id']} (task #{item['task_id']}): {item['reason']}")
+            for item in result["errors"]:
+                print(f"Task #{item['task_id']} failed: {item['error']}")
+            for warning in result["warnings"]:
+                print(f"Warning: {warning}")
+            return 1 if result["errors"] else 0
+        plan = github_issues.preview_all(conn)
+        print(f"{plan['ready']} issue(s) to create, {plan['blocked']} can't be created; boards: {', '.join(plan['boards']) or 'none'}\n")
+        for issue in plan["issues"]:
+            print(f"  task #{issue['task_id']} #{issue['finding_id']} {issue['title']}\n     {issue['problem'] or issue['repo']}")
+        print("\nCreate them with: audit-agent issues --all --create")
+        return 0
+    if args.task_id is None:
+        print("error: give a task id, or --all", file=sys.stderr)
+        return 1
     if args.create:
         result = github_issues.create(conn, args.task_id)
         for item in result["created"]:
@@ -379,6 +436,119 @@ def _issues(args: argparse.Namespace, conn) -> int:
         state = issue["issue_url"] or issue["problem"] or f"would create in {issue['repo']}"
         print(f"  #{issue['finding_id']} {issue['title']}\n     labels: {', '.join(issue['labels'])}\n     {state}")
     print("\nCreate them with: audit-agent issues", args.task_id, "--create")
+    return 0
+
+
+VERDICT_LABELS = {"reproduced": "reproduced", "not_reproduced": "not reproduced", "unable": "unable to reproduce"}
+
+
+def _print_verification(v: dict) -> None:
+    if v["status"] == "done":
+        print(f"Verdict: {VERDICT_LABELS[v['verdict']]}\n{v['reason']}")
+    else:
+        print(f"Status: {v['status']}" + (f"\n{v['error']}" if v["error"] else ""))
+    if v["manual_steps"]:
+        print(f"\nManual steps:\n{v['manual_steps']}")
+    if v["conclusion"]:
+        print(f"\nVerifier's conclusion: {v['conclusion']}")
+    if v["test_path"]:
+        print(f"\nTest: {v['test_path']}" + (f" ({v['test_name']})" if v["test_name"] else ""))
+    cached = v["cache_read_tokens"] + v["cache_write_tokens"]
+    total_in = v["input_tokens"] + cached
+    cost = f"${v['cost_usd']:.2f}" if v["cost_usd"] is not None else "unknown cost"
+    print(f"Run: {v['num_turns']} turns, {cost}, {total_in:,} input tokens"
+          + (f" ({v['cache_read_tokens'] * 100 // total_in}% read from the cache)" if total_in else "")
+          + f", {v['output_tokens']:,} output tokens, {(v['duration_ms'] or 0) / 1000:.0f} s")
+
+
+def _reproduce(args: argparse.Namespace, conn) -> int:
+    if args.show_prompt:
+        print(reproduce.show_prompt(conn, args.finding_id))
+        return 0
+    finding = store.get_finding(conn, args.finding_id)
+    print(f"Reproducing finding #{finding['id']}: {finding['title']} ({finding['file_path']}:{finding['line']}) ...",
+          file=sys.stderr)
+    settings = reproduce.ReproduceSettings(model=args.model, max_turns=args.max_turns, max_cost_usd=args.max_cost_usd)
+    result = reproduce.reproduce(conn, args.finding_id, settings, log=lambda m: print(m, file=sys.stderr, flush=True))
+    _print_verification(result)
+    print(f"\nShow the test and its output with: audit-agent verifications --id {result['id']}")
+    return 0 if result["status"] == "done" else 1
+
+
+def _reproduce_setup(args: argparse.Namespace, conn) -> int:
+    result = reproduce.check_setup(conn, args.audit_id, log=lambda m: print(m, file=sys.stderr, flush=True))
+    print(result["output"])
+    ok = result["network_blocked"] and result["repository_unchanged"] and result["copy_unchanged"]
+    print(f"\n{result['repo']} (package {result['package']}): {result['example']} had {result['passed']} passing and "
+          f"{result['failed']} failing test(s) in {result['duration_ms'] / 1000:.1f} s.")
+    print(f"Network off: {'yes' if result['network_blocked'] else 'NO'}. Repository unchanged: "
+          f"{'yes' if result['repository_unchanged'] else 'NO'}. Verifier tests go in {result['test_dir']}/.")
+    print(f"Fake .env names: {', '.join(result['env_names']) or 'none'}")
+    return 0 if ok and result["passed"] and not result["failed"] else 1
+
+
+def _verifications(args: argparse.Namespace, conn) -> int:
+    if args.id:
+        v = dict(store.get_verification(conn, args.id))
+        finding = store.get_finding(conn, v["finding_id"])
+        print(f"Verification #{v['id']} of finding #{finding['id']}: {finding['title']}\n")
+        _print_verification(v)
+        if v["test_code"]:
+            print(f"\n--- {v['test_path']} ---\n{v['test_code']}")
+        if v["test_output"]:
+            print(f"\n--- output of the app's own run ---\n{v['test_output']}")
+        return 0
+    rows = []
+    for r in store.list_verifications(conn, finding_id=args.finding, audit_id=args.audit):
+        note = (r["reason"] or r["error"] or "").strip()
+        rows.append({**dict(r), "verdict": VERDICT_LABELS.get(r["verdict"], ""),
+                     "cost_usd": "" if r["cost_usd"] is None else f"{r['cost_usd']:.2f}",
+                     "reason": note.splitlines()[0][:80] if note else ""})
+    print(views.format_table(rows, ["id", "finding_id", "status", "verdict", "num_turns", "cost_usd", "started_at", "reason"]))
+    return 0
+
+
+def _prs(args: argparse.Namespace, conn) -> int:
+    if args.open:
+        result = pull_requests.open_all(conn)
+        print(f"Opened {len(result['opened'])} draft pull request(s).")
+        for item in result["opened"]:
+            print(f"  finding #{item['finding_id']}: {item['url']}")
+        for item in result["skipped"]:
+            print(f"  finding #{item['finding_id']} skipped: {item['reason']}")
+        for item in result["failed"]:
+            print(f"  finding #{item['finding_id']} failed: {item['error']}")
+        return 1 if result["failed"] else 0
+    plan = pull_requests.preview_all(conn)
+    print(f"{len(plan['ready'])} draft pull request(s) ready, {len(plan['blocked'])} can't be opened:")
+    for p in plan["ready"]:
+        print(f"  finding #{p['finding_id']} -> {p['repo']} {p['branch']} (base {p['base']}): {p['title']}")
+        for warning in p["warnings"]:
+            print(f"     note: {warning}")
+    for p in plan["blocked"]:
+        print(f"  finding #{p['finding_id']} blocked: {p['problems'][0]}")
+    if plan["ready"]:
+        print("\nOpen them with: audit-agent prs --open")
+    return 0
+
+
+def _fix_comments(args: argparse.Namespace, conn) -> int:
+    if args.post:
+        result = pull_requests.post_missing_comments(conn)
+        print(f"Posted {len(result['posted'])} comment(s).")
+        for item in result["posted"]:
+            print(f"  fix attempt #{item['attempt_id']}: {item['url']}")
+        for item in result["failed"]:
+            print(f"  fix attempt #{item['attempt_id']} failed: {item['error']}")
+        return 1 if result["failed"] else 0
+    due = store.fixes_missing_comments(conn)
+    print(f"{len(due)} issue comment(s) to post:")
+    for attempt in due:
+        finding = store.get_finding(conn, attempt["finding_id"])
+        what = "pull request link" if attempt["pr_url"] else attempt["outcome"].replace("_", " ")
+        print(f"  fix attempt #{attempt['id']} ({what}) -> {finding['issue_url']}  {finding['title'][:70]}")
+    if due:
+        print("\nPost them with: audit-agent fix-comments --post")
     return 0
 
 
@@ -418,6 +588,11 @@ def _set_api_key(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {
+    "prs": _prs,
+    "fix-comments": _fix_comments,
+    "reproduce": _reproduce,
+    "reproduce-setup": _reproduce_setup,
+    "verifications": _verifications,
     "issues": _issues,
     "batch-send": _batch_send,
     "batches": _batches,
@@ -464,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             conn.close()
     except (RepositoryError, store.StoreError, planning.PlanningError, investigation.InvestigationError,
-            batches.BatchError, github_issues.IssueError) as exc:
+            batches.BatchError, github_issues.IssueError, reproduce.ReproduceError, sandbox.SandboxError,
+            pull_requests.PullRequestError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

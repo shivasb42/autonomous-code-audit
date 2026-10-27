@@ -100,7 +100,7 @@ class BatchTest(BatchTestCase):
         (request,) = remote["requests"]
         self.assertRegex(request["custom_id"], rf"^task-{self.lib}-[0-9a-f]{{8}}$")
         params = request["params"]
-        self.assertEqual(params["tool_choice"], {"type": "tool", "name": "submit_report"})
+        self.assertEqual(params["tool_choice"], {"type": "auto"}, "forcing a tool isn't supported by every model")
         self.assertEqual([t["name"] for t in params["tools"]], ["submit_report"])
         prompt = params["messages"][0]["content"]
         self.assertIn("=== lib/main.dart ===", prompt)
@@ -140,6 +140,25 @@ class BatchTest(BatchTestCase):
 
         self.assertEqual(batches.check(self.conn, self.log)["checked"], 0)
         self.assertEqual(len(store.list_findings(self.conn, task_id=self.lib)), 1, "importing never repeats")
+
+    def test_a_report_written_as_text_is_accepted(self):
+        text = "Here is my report:\n```json\n" + json.dumps({"findings": [FINDING], "needs_review": []}) + "\n```"
+        self.fake.answer = lambda custom_id, params: {"type": "succeeded", "message": {
+            "id": "msg_2", "model": "claude-sonnet-5-5", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": text}], "usage": {"input_tokens": 100, "output_tokens": 50}}}
+        batches.submit(self.conn, [self.lib], log=self.log)
+        self.fake.end()
+        batches.check(self.conn, self.log)
+        self.assertEqual(len(store.list_findings(self.conn, task_id=self.lib)), 1)
+
+    def test_an_answer_without_a_report_fails_the_task_clearly(self):
+        self.fake.answer = lambda custom_id, params: {"type": "succeeded", "message": {
+            "id": "msg_3", "model": "claude-sonnet-5-5", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "I looked at the code."}], "usage": {}}}
+        batches.submit(self.conn, [self.lib], log=self.log)
+        self.fake.end()
+        batches.check(self.conn, self.log)
+        self.assertIn("had no report", store.task_runs(self.conn, self.lib)[0]["error"])
 
     def test_made_up_citations_are_rejected_like_a_live_run(self):
         bad = {**FINDING, "file": "lib/does_not_exist.dart"}

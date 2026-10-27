@@ -1,6 +1,7 @@
 """Local review page: `audit-agent ui` serves projects, their apps and task queues, and each
 project's API map on 127.0.0.1 only. Everything shown is read from the audit database. The page
-can also send tasks to Claude (see runner), which investigates them with read-only tools.
+can also send tasks to Claude (see runner), which investigates them with read-only tools, and send
+findings that have a GitHub issue to be reproduced with a test (see reproduce).
 
 Write requests must send the `X-Audit-Agent` header and a JSON body. Browsers will not send a
 custom header cross-origin without a CORS preflight, which this server never approves, so other
@@ -20,9 +21,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from audit_agent import batches, credentials, github_issues, review, store, views
+from audit_agent import batches, credentials, github_issues, pull_requests, review, store, views
+from audit_agent.fix import FixSettings
 from audit_agent.investigate import AgentSettings, InvestigationError
-from audit_agent.runner import Runner, print_log
+from audit_agent.reproduce import ReproduceSettings
+from audit_agent.runner import FixRunner, ReproductionRunner, Runner, print_log
 
 PAGE = Path(__file__).with_name("web") / "index.html"
 WRITE_HEADER = "X-Audit-Agent"
@@ -43,7 +46,8 @@ def _filter_from(params: dict) -> review.TaskFilter:
         return value or None
 
     try:
-        return review.TaskFilter(one("status"), one("folder"), one("tests"), one("search"), one("app"), one("kind"))
+        return review.TaskFilter(one("status"), one("folder"), one("tests"), one("search"), one("app"), one("kind"),
+                                 one("api"))
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
@@ -87,7 +91,8 @@ def _audit_tasks(conn: sqlite3.Connection, audit_id: int, params: dict) -> dict:
         r["task_id"]: (r["n"], r["without_issue"])
         for r in conn.execute(
             """SELECT f.task_id, COUNT(*) AS n, SUM(f.issue_url IS NULL) AS without_issue
-               FROM findings f JOIN audit_tasks t ON t.id = f.task_id WHERE t.audit_id = ? GROUP BY f.task_id""",
+               FROM findings f JOIN audit_tasks t ON t.id = f.task_id
+               WHERE t.audit_id = ? AND f.duplicate_of IS NULL GROUP BY f.task_id""",
             (audit_id,),
         )
     }
@@ -97,7 +102,7 @@ def _audit_tasks(conn: sqlite3.Connection, audit_id: int, params: dict) -> dict:
         "counts": counts,
         "tasks": [
             {**{k: t[k] for k in ("id", "title", "status", "priority", "priority_reason", "line_count", "file_count",
-                                  "test_only", "app_root", "kind")},
+                                  "test_only", "app_root", "kind", "api_covered", "api_task_ids")},
              "in_batch": t["id"] in in_batch,
              "findings": found.get(t["id"], (0, 0))[0],
              "findings_without_issue": found.get(t["id"], (0, 0))[1]}
@@ -162,7 +167,36 @@ def _create_issues(server: "ReviewServer", conn: sqlite3.Connection, task_id: in
     return {**result, "preview": github_issues.preview(conn, task_id)}
 
 
+def _reproduce(queue: ReproductionRunner, body: dict) -> dict:
+    if "parallel" in body:
+        try:
+            queue.set_parallel(int(body["parallel"]))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "body must include 'ids', a list of finding ids")
+    return {**queue.submit(ids), "status": queue.status()}
+
+
+def _open_all_prs(server: "ReviewServer", conn: sqlite3.Connection) -> dict:
+    return {**pull_requests.open_all(conn, log=server.runner.log), "preview": pull_requests.preview_all(conn)}
+
+
+def _open_pr(server: "ReviewServer", conn: sqlite3.Connection, attempt_id: int) -> dict:
+    try:
+        return pull_requests.open_pr(conn, attempt_id, log=server.runner.log)
+    except pull_requests.PullRequestError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, str(exc)) from exc
+
+
+def _create_all_issues(server: "ReviewServer", conn: sqlite3.Connection) -> dict:
+    result = github_issues.create_all(conn, log=server.runner.log)
+    return {**result, "preview": github_issues.preview_all(conn)}
+
+
 ROUTES_GET = [
+    (re.compile(r"^/api/issues$"), lambda s, conn, m, q: github_issues.preview_all(conn)),
     (re.compile(r"^/api/tasks/(\d+)/issues$"), lambda s, conn, m, q: github_issues.preview(conn, int(m[1]))),
     (re.compile(r"^/api/batches$"), lambda s, conn, m, q: _batch_status(s, conn)),
     (re.compile(r"^/api/projects$"), lambda s, conn, m, q: views.project_overview(conn)),
@@ -171,6 +205,12 @@ ROUTES_GET = [
     (re.compile(r"^/api/audits/(\d+)/tasks$"), lambda s, conn, m, q: _audit_tasks(conn, int(m[1]), q)),
     (re.compile(r"^/api/tasks/(\d+)$"), lambda s, conn, m, q: views.task_detail(conn, int(m[1]))),
     (re.compile(r"^/api/run$"), lambda s, conn, m, q: s.runner.status()),
+    (re.compile(r"^/api/findings$"), lambda s, conn, m, q: views.findings_overview(conn)),
+    (re.compile(r"^/api/findings/(\d+)$"), lambda s, conn, m, q: views.finding_detail(conn, int(m[1]))),
+    (re.compile(r"^/api/reproduce$"), lambda s, conn, m, q: s.reproducer.status()),
+    (re.compile(r"^/api/fix$"), lambda s, conn, m, q: s.fixer.status()),
+    (re.compile(r"^/api/fixes/(\d+)/pr$"), lambda s, conn, m, q: pull_requests.preview(conn, int(m[1]))),
+    (re.compile(r"^/api/prs$"), lambda s, conn, m, q: pull_requests.preview_all(conn)),
 ]
 
 ROUTES_POST = [
@@ -186,6 +226,14 @@ ROUTES_POST = [
     ),
     (re.compile(r"^/api/run$"), lambda s, conn, m, b: _send_to_claude(s, b)),
     (re.compile(r"^/api/run/stop$"), lambda s, conn, m, b: {"dropped": s.runner.stop(), "status": s.runner.status()}),
+    (re.compile(r"^/api/reproduce$"), lambda s, conn, m, b: _reproduce(s.reproducer, b)),
+    (re.compile(r"^/api/reproduce/stop$"),
+     lambda s, conn, m, b: {"dropped": s.reproducer.stop(), "status": s.reproducer.status()}),
+    (re.compile(r"^/api/fix$"), lambda s, conn, m, b: _reproduce(s.fixer, b)),
+    (re.compile(r"^/api/fix/stop$"), lambda s, conn, m, b: {"dropped": s.fixer.stop(), "status": s.fixer.status()}),
+    (re.compile(r"^/api/fixes/(\d+)/pr$"), lambda s, conn, m, b: _open_pr(s, conn, int(m[1]))),
+    (re.compile(r"^/api/prs$"), lambda s, conn, m, b: _open_all_prs(s, conn)),
+    (re.compile(r"^/api/issues$"), lambda s, conn, m, b: _create_all_issues(s, conn)),
     (re.compile(r"^/api/tasks/(\d+)/issues$"), lambda s, conn, m, b: _create_issues(s, conn, int(m[1]), b)),
     (re.compile(r"^/api/batches$"), lambda s, conn, m, b: _send_batch(s, conn, b)),
     (re.compile(r"^/api/batches/check$"), lambda s, conn, m, b: _batch_call(s, conn, s.poller.check_now)),
@@ -270,9 +318,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
 class ReviewServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, db_path: Path, port: int = 8765, runner: Runner | None = None):
+    def __init__(self, db_path: Path, port: int = 8765, runner: Runner | None = None,
+                 reproducer: ReproductionRunner | None = None, fixer: FixRunner | None = None):
         self.db_path = db_path
         self.runner = runner or Runner(db_path, AgentSettings())
+        self.reproducer = reproducer or ReproductionRunner(
+            db_path, ReproduceSettings(model=self.runner.settings.model), log=self.runner.log)
+        self.fixer = fixer or FixRunner(db_path, FixSettings(model=self.runner.settings.model), log=self.runner.log)
         self.poller = batches.Poller(db_path, log=self.runner.log)
         super().__init__(("127.0.0.1", port), ReviewHandler)
 
@@ -294,12 +346,18 @@ def serve(db_path: Path, port: int, open_browser: bool, settings: AgentSettings 
         if interrupted := store.fail_interrupted_runs(conn):
             print(f"Marked {interrupted} interrupted investigation(s) as failed; they can be sent to Claude again.",
                   flush=True)
+        if interrupted := store.fail_interrupted_verifications(conn):
+            print(f"Marked {interrupted} interrupted reproduction(s) as failed; they can be started again.", flush=True)
+        if interrupted := store.fail_interrupted_fixes(conn):
+            print(f"Marked {interrupted} interrupted fix attempt(s) as failed; they can be started again.", flush=True)
     finally:
         conn.close()
     server = ReviewServer(db_path, port, Runner(db_path, settings or AgentSettings(), parallel))
     print(f"Task review page: {server.url}  (Ctrl+C to stop)", flush=True)
     print(f"Tasks sent to Claude run {server.runner.parallel} at a time using {server.runner.status()['runner']}.",
           flush=True)
+    print(f"Findings sent to reproduce (Findings tab) run {server.reproducer.parallel} at a time using "
+          f"{server.reproducer.runner_label()}.", flush=True)
     server.poller.start()
     conn = store.connect(db_path)
     try:

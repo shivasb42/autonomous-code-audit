@@ -135,6 +135,55 @@ class InvestigateTest(unittest.TestCase):
         run = store.task_runs(self.conn, task_id)[-1]
         self.assertEqual((run["status"], run["cost_usd"], run["num_turns"]), ("done", 0.12, 5))
 
+    def test_known_findings_are_shown_and_repeats_are_kept_out(self):
+        from audit_agent import github_issues, views
+        root, audit_id = self._audit(DART_REPO)
+        task_id = self._task(audit_id, "Audit lib")
+        investigate.investigate(self.conn, task_id)
+        first = {f["title"]: f["id"] for f in store.list_findings(self.conn, task_id=task_id)}
+        known_id = first["App starts before async setup finishes"]
+        review_id = first["Quotes code that isn't there"]
+
+        evidence = "runApp(const App());"
+        self.report_path.write_text(json.dumps({
+            "findings": [
+                {"title": "App is started before setup is done", "bug_type": "concurrency", "severity": "high",
+                 "file": "lib/main.dart", "line": 10, "evidence": evidence, "explanation": "Same bug.",
+                 "duplicate_of": known_id},
+                {"title": "Made-up duplicate number", "bug_type": "logic", "severity": "low", "file": "lib/main.dart",
+                 "line": 10, "evidence": evidence, "explanation": "x", "duplicate_of": 99999},
+                {"title": "App starts before the async setup finishes", "bug_type": "concurrency", "severity": "medium",
+                 "file": "lib/main.dart", "line": 11, "evidence": evidence, "explanation": "Claude didn't say."},
+                {"title": "Unrelated crash on resume", "bug_type": "logic", "severity": "low", "file": "lib/main.dart",
+                 "line": 10, "evidence": evidence, "explanation": "A different bug at the same place."},
+            ],
+            "needs_review": [{"title": "Ownership again", "suspicion": "s", "why_unconfirmed": "w",
+                              "duplicate_of": f"#{review_id}"}],
+        }))
+        summary = investigate.investigate(self.conn, task_id, again=True)
+
+        prompt = json.loads(self.log_path.read_text())["prompt"]
+        self.assertIn("Already known in these files", prompt)
+        self.assertIn(f"#{known_id} [high concurrency] App starts before async setup finishes", prompt)
+        self.assertIn(f"#{review_id} [to review] Quotes code that isn't there", prompt)
+        self.assertNotIn("Backend may not check ownership", prompt, "items citing no file of the task aren't listed")
+
+        saved = {f["title"]: f for f in store.list_findings(self.conn, task_id=task_id) if f["id"] not in first.values()}
+        self.assertEqual(saved["App is started before setup is done"]["duplicate_of"], known_id)
+        self.assertEqual(saved["Ownership again"]["duplicate_of"], review_id)
+        self.assertIsNone(saved["Made-up duplicate number"]["duplicate_of"], "only numbers the prompt listed count")
+        self.assertEqual(saved["App starts before the async setup finishes"]["possible_duplicate_of"], known_id)
+        self.assertIsNone(saved["App starts before the async setup finishes"]["duplicate_of"], "a hint never hides")
+        self.assertIsNone(saved["Unrelated crash on resume"]["possible_duplicate_of"], "a different bug isn't flagged")
+        self.assertEqual((summary["findings"], summary["needs_review"], summary["duplicates"]), (3, 0, 2))
+
+        repeat_ids = {saved["App is started before setup is done"]["id"], saved["Ownership again"]["id"]}
+        issues = {i["finding_id"] for i in github_issues.preview(self.conn, task_id)["issues"]}
+        self.assertFalse(repeat_ids & issues, "repeats get no GitHub issue")
+        listed = {f["id"] for f in views.findings_overview(self.conn)["findings"]}
+        self.assertFalse(repeat_ids & listed, "repeats aren't listed on the Findings tab")
+        self.assertIn(saved["App starts before the async setup finishes"]["id"], listed)
+
     def test_agent_runs_read_only_with_task_context(self):
         root, audit_id = self._audit(NODE_REPO)
         task_id = self._task(audit_id, "Audit src")

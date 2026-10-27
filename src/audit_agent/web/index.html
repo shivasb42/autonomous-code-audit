@@ -111,6 +111,17 @@
   .sev.critical, .sev.high { color: var(--danger); }
   .sev.medium { color: #8a5a00; }
   .sev.low { color: var(--muted); }
+  .badge.reproduced { background: #f9eaea; color: var(--danger); font-weight: 600; }
+  .badge.not_reproduced { background: #e8f5ee; color: var(--ok); }
+  .badge.unable { background: #fff4dc; color: #8a5a00; }
+  .badge.not_tried { background: #eef1f6; color: var(--muted); }
+  .badge.seen { background: #fff4dc; color: #8a5a00; margin-left: 6px; }
+  .badge.fixed { background: #e8f5ee; color: var(--ok); font-weight: 600; }
+  .badge.fix_rejected { background: #fff4dc; color: #8a5a00; }
+  .attempt { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  .attempt pre, .claim pre { margin: 4px 0; padding: 6px 8px; background: #f6f7f9; border-radius: 6px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; }
+  .attempt .why { white-space: pre-wrap; margin: 4px 0; }
+  .filters label { display: flex; gap: 6px; align-items: center; }
   #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1d2330; color: #fff; padding: 8px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; }
   #toast.show { opacity: 1; }
   [hidden] { display: none !important; }
@@ -122,8 +133,12 @@
   <span id="where" class="reason"></span>
   <div class="tabs">
     <button id="tab-tasks" class="active">Tasks</button>
+    <button id="tab-findings" title="Every finding across tasks: pick some and reproduce them with a test">Findings</button>
     <button id="tab-api">API map</button>
   </div>
+  <span style="flex:1"></span>
+  <button id="prs-all" class="ok" hidden title="A draft pull request for every checked fix that has none yet">Open all pending draft PRs</button>
+  <button id="issues-all" class="primary" hidden title="Every finding that has no GitHub issue yet, across all tasks">Create missing GitHub issues</button>
 </header>
 <div class="layout">
   <nav class="panel" id="sidebar"><div class="empty">Loading…</div></nav>
@@ -146,6 +161,12 @@
             <option value="only">Only test code</option>
           </select>
           <input id="search" type="text" placeholder="Search titles and files">
+          <select id="api-seen" title="File groups whose files a finished API-call task already looked at">
+            <option value="">With or without API-task overlap</option>
+            <option value="all">File groups: all files already looked at in API tasks</option>
+            <option value="some">File groups: some files already looked at in API tasks</option>
+            <option value="none">File groups: not looked at in API tasks</option>
+          </select>
         </div>
         <div class="bulk">
           <span id="selection">0 selected</span>
@@ -188,6 +209,62 @@
       </section>
       <aside class="panel" id="detail"><div class="empty">Select a task to see its files and connections.</div></aside>
     </div>
+    <div id="findings-view" class="tasks-grid" hidden>
+      <section class="panel">
+        <div class="app-info">
+          <h2>Findings</h2>
+          <div class="reason">Pick findings and click Reproduce. For each one, an independent Claude verifier gets only the
+            claim and tries to disprove it by writing one test in a throwaway copy of the repository. The app then runs the
+            test itself with the network off, and that result is the verdict. Your repository is never changed.
+            Only findings that have a GitHub issue can be sent.</div>
+        </div>
+        <div class="counts" id="f-counts"></div>
+        <div class="filters">
+          <label><input type="checkbox" id="f-issue" checked> Has a GitHub issue</label>
+          <select id="f-app"><option value="">All apps</option></select>
+          <select id="f-severity">
+            <option value="">Any severity</option>
+            <option value="critical">critical</option><option value="high">high</option>
+            <option value="medium">medium</option><option value="low">low</option>
+          </select>
+          <select id="f-type">
+            <option value="">Any bug type</option>
+            <option value="logic">logic</option><option value="security">security</option><option value="concurrency">concurrency</option>
+          </select>
+          <select id="f-repro"><option value="">Any reproduction status</option></select>
+          <select id="f-fix"><option value="">Any fix status</option></select>
+          <input id="f-search" type="text" placeholder="Search titles and files">
+        </div>
+        <div class="bulk claude-bar">
+          <strong>Reproduce</strong>
+          <span id="f-selection">0 selected</span>
+          <button id="f-reproduce" class="primary" disabled>Reproduce selected</button>
+          <label>at a time <input id="f-parallel" type="number" min="1" max="4" value="2"></label>
+          <span class="spacer"></span>
+          <span id="f-summary"></span>
+          <button id="f-stop" hidden title="Drop queued findings; running ones finish">Stop queue</button>
+        </div>
+        <div class="run-detail" id="f-run-detail"></div>
+        <div class="bulk claude-bar">
+          <strong>Reproduce + fix</strong>
+          <span class="reason">cheaper, one agent: proves the bug with a test, then fixes it in a throwaway copy. A draft pull request is opened only when you click.</span>
+          <button id="fx-send" class="primary" disabled>Reproduce + fix selected</button>
+          <label>at a time <input id="fx-parallel" type="number" min="1" max="4" value="1"></label>
+          <span class="spacer"></span>
+          <span id="fx-summary"></span>
+          <button id="fx-stop" hidden title="Drop queued findings; running ones finish">Stop queue</button>
+        </div>
+        <div class="run-detail" id="fx-run-detail"></div>
+        <table>
+          <thead><tr>
+            <th><input type="checkbox" id="f-select-all" title="Select all shown that can be sent"></th>
+            <th>Severity</th><th>Finding</th><th>Reproduction</th><th>Fix</th><th></th>
+          </tr></thead>
+          <tbody id="f-rows"></tbody>
+        </table>
+      </section>
+      <aside class="panel" id="f-detail"><div class="empty">Select a finding to see its claim and every attempt to reproduce it.</div></aside>
+    </div>
     <div id="api-view" class="panel api" hidden></div>
   </div>
 </div>
@@ -199,7 +276,8 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const typeBadge = (t) => `<span class="type ${esc(t)}">${TYPE_LABELS[t] || esc(t)}</span>`;
 const RUNNABLE = ["pending", "failed", "blocked"];
-const state = { groups: [], app: null, project: null, tab: "tasks", tasks: [], selected: new Set(), openTask: null, apiMap: null, run: null, batches: null };
+const state = { groups: [], app: null, project: null, tab: "tasks", tasks: [], selected: new Set(), openTask: null, apiMap: null, run: null, batches: null,
+                findings: null, fSelected: new Set(), openFinding: null, repro: null, fix: null };
 
 async function api(path, body) {
   const options = body === undefined ? {} : {
@@ -236,13 +314,14 @@ const taskTotal = (a) => Object.values(a.task_counts).reduce((x, y) => x + y, 0)
 function filter() {
   return {
     status: $("status").value, folder: $("folder").value.trim(), tests: $("tests").value, search: $("search").value.trim(),
-    app: state.app?.root ?? "", kind: $("kind").value,
+    app: state.app?.root ?? "", kind: $("kind").value, api: $("api-seen").value,
   };
 }
 
 function writeHash() {
   const p = new URLSearchParams();
   if (state.tab === "api" && state.project?.id) { p.set("project", state.project.id); p.set("tab", "api"); }
+  else if (state.tab === "findings") p.set("tab", "findings");
   else if (state.app) p.set("app", appKey(state.app));
   history.replaceState(null, "", "#" + p);
 }
@@ -290,6 +369,7 @@ async function loadGroups() {
     const g = state.groups.find((x) => String(x.id) === hash.get("project"));
     if (g) return showApiMap(g);
   }
+  if (hash.get("tab") === "findings") return showFindings();
   const wanted = apps.find(({ a }) => appKey(a) === hash.get("app")) || apps[0];
   if (wanted) return selectApp(wanted.a, wanted.g);
   renderSidebar();
@@ -312,11 +392,13 @@ async function selectApp(app, group) {
 
 function showTab() {
   $("tasks-view").hidden = state.tab !== "tasks";
+  $("findings-view").hidden = state.tab !== "findings";
   $("api-view").hidden = state.tab !== "api";
   $("tab-tasks").classList.toggle("active", state.tab === "tasks");
+  $("tab-findings").classList.toggle("active", state.tab === "findings");
   $("tab-api").classList.toggle("active", state.tab === "api");
   $("tab-api").disabled = !state.project?.id;
-  $("where").textContent = state.project ? state.project.name : "";
+  $("where").textContent = state.tab === "findings" ? "all projects" : state.project ? state.project.name : "";
 }
 
 async function loadTasks() {
@@ -347,11 +429,14 @@ async function loadTasks() {
       actions += ' <span class="reason">issues created</span>';
     }
     const findingsBadge = t.findings ? ` <span class="badge broken">${t.findings} finding${t.findings === 1 ? "" : "s"}</span>` : "";
+    const seenBadge = t.api_covered
+      ? ` <span class="badge seen" title="Looked at by finished API-call task${t.api_task_ids.length === 1 ? "" : "s"} ${t.api_task_ids.map((i) => `#${i}`).join(", ")}, for those calls only. Open the task for details.">looked at in API tasks: ${t.api_covered} of ${t.file_count} file${t.file_count === 1 ? "" : "s"}</span>`
+      : "";
     return `
     <tr class="row ${t.status} ${state.openTask === t.id ? "selected" : ""}" data-id="${t.id}">
       <td><input type="checkbox" class="pick" data-id="${t.id}" ${state.selected.has(t.id) ? "checked" : ""}></td>
       <td class="num">${t.priority}</td>
-      <td><div class="title">${t.kind === "api" ? '<span class="badge api">API</span> ' : ""}${esc(t.title)}${t.test_only ? '<span class="badge test">test</span>' : ""}${findingsBadge}</div><div class="reason">${esc(t.priority_reason)}</div></td>
+      <td><div class="title">${t.kind === "api" ? '<span class="badge api">API</span> ' : ""}${esc(t.title)}${t.test_only ? '<span class="badge test">test</span>' : ""}${findingsBadge}${seenBadge}</div><div class="reason">${esc(t.priority_reason)}</div></td>
       <td><span class="badge ${status}">${status}</span></td>
       <td class="num">${t.file_count}</td>
       <td class="num">${t.line_count.toLocaleString()}</td>
@@ -386,8 +471,25 @@ async function showTask(id) {
     <div class="reason">${d.app ? `${typeBadge(d.app.type)} ${esc(d.app.name)} &middot; ` : ""}Task #${d.task.id} &middot; ${d.task.status} &middot; priority ${d.task.priority} (${esc(d.task.priority_reason)})</div>
     ${d.api ? apiCallSection(d.api) : ""}
     <h3>Files to audit (${d.files.length})</h3>${list(d.files, (f) => `${f.role ? `<span class="role">${esc(f.role)}</span> ` : ""}${f.repo_name && d.api ? `<span class="reason">${esc(f.repo_name)}:</span> ` : ""}<code>${esc(f.path)}</code> <span class="reason">${f.line_count ?? "?"} lines</span>`, 100)}
+    ${d.api_seen && d.api_seen.files.length ? apiSeenSection(d.api_seen) : ""}
     ${d.api ? "" : fileTaskSections(d, list)}
     ${claudeSection(d)}`;
+}
+
+function apiSeenSection(seen) {
+  const files = seen.files.map((f) => `<li><code>${esc(f.path)}</code> <span class="reason">in</span> ${f.api_tasks.map((t) =>
+    `<a href="#" class="open-task" data-id="${t.id}" title="${esc(t.repo)}: ${esc(t.title)}">#${t.id}</a>`).join(", ")}</li>`).join("");
+  const found = seen.findings.length
+    ? `<ul>${seen.findings.map((f) => `<li>${f.kind === "finding" ? `<span class="sev ${esc(f.severity)}">${esc(f.severity)}</span>` : '<span class="reason">to review</span>'}
+        ${esc(f.title)} <span class="reason"><code>${esc(f.file_path)}:${f.line ?? ""}</code> &middot; task #${f.task_id}</span>
+        ${f.issue_url ? `<a href="${esc(f.issue_url)}" target="_blank" rel="noopener">issue &#8599;</a>` : ""}</li>`).join("")}</ul>`
+    : '<div class="reason">Those API tasks found nothing in these files.</div>';
+  return `
+    <h3>Already looked at in API tasks (${seen.files.length} of ${seen.total_files} files)</h3>
+    <div class="reason">An API task reads a file to check one API call (its route, handler, request, response, and auth),
+      not the whole file. Other code in these files may not have been checked. Sending this task is your call.</div>
+    <ul>${files}</ul>
+    <div style="margin-top:6px"><strong>Found there by those API tasks (${seen.findings.length})</strong></div>${found}`;
 }
 
 function fileTaskSections(d, list) {
@@ -430,11 +532,18 @@ function claudeSection(d) {
         ${r.duration_ms ? ` &middot; ${Math.round(r.duration_ms / 1000)}s` : ""}${r.cost_usd != null ? ` &middot; $${r.cost_usd.toFixed(2)}` : ""}
         ${r.error ? `<div class="err">${esc(r.error)}</div>` : ""}</li>`).join("")}</ul>`
     : '<div class="reason">Not investigated yet.</div>';
-  const findings = d.findings.filter((f) => f.kind === "finding");
-  const review = d.findings.filter((f) => f.kind === "needs_review");
+  const duplicates = d.findings.filter((f) => f.duplicate_of);
+  const current = d.findings.filter((f) => !f.duplicate_of);
+  const findings = current.filter((f) => f.kind === "finding");
+  const review = current.filter((f) => f.kind === "needs_review");
   const issueLink = (f) => f.issue_url ? ` <a href="${esc(f.issue_url)}" target="_blank" rel="noopener">GitHub issue &#8599;</a>` : "";
+  const maybeDup = (f) => f.possible_duplicate_of
+    ? ` <span class="badge seen" title="Same file, within 3 lines, similar title. Only a hint: check whether it's really the same bug.">possible duplicate of #${f.possible_duplicate_of}</span>` : "";
+  const duplicateHtml = duplicates.map((f) => `<div class="finding review">
+      <div><strong>${esc(f.title)}</strong> <span class="reason">Claude says: same bug as #${f.duplicate_of}</span></div>
+      ${f.file_path ? `<div class="meta"><code>${esc(f.file_path)}:${f.line ?? ""}</code></div>` : ""}</div>`).join("");
   const findingHtml = findings.map((f) => `<div class="finding">
-      <div><span class="sev ${esc(f.severity)}">${esc(f.severity)}</span> ${esc(f.bug_type)}: <strong>${esc(f.title)}</strong>${issueLink(f)}</div>
+      <div><span class="sev ${esc(f.severity)}">${esc(f.severity)}</span> ${esc(f.bug_type)}: <strong>${esc(f.title)}</strong>${issueLink(f)}${maybeDup(f)}</div>
       <div class="meta">${f.file_audit_id && f.file_audit_id !== f.audit_id ? `${esc(f.file_repo)}: ` : ""}<code>${esc(f.file_path)}:${f.line}</code> &middot; ${esc(f.agent)} agent</div>
       ${f.evidence ? `<pre>${esc(f.evidence)}</pre>` : ""}
       <div>${esc(f.explanation)}</div></div>`).join("");
@@ -447,11 +556,12 @@ function claudeSection(d) {
     <h3>Claude ${button}</h3>
     ${sent ? `<div class="reason">Sent to Claude: ${esc(sent)}</div>` : ""}
     ${runs}
-    ${d.findings.some((f) => !f.issue_url)
-      ? `<div style="margin-top:12px"><button class="issues-btn" data-id="${d.task.id}">Create GitHub issues (${d.findings.filter((f) => !f.issue_url).length})</button>
+    ${current.some((f) => !f.issue_url)
+      ? `<div style="margin-top:12px"><button class="issues-btn" data-id="${d.task.id}">Create GitHub issues (${current.filter((f) => !f.issue_url).length})</button>
          <span class="reason">for this task's findings and items to review</span></div>` : ""}
     <h3>Findings (${findings.length})</h3>${findingHtml || '<div class="reason">none</div>'}
-    <h3>Needs your review (${review.length}), not counted as bugs</h3>${reviewHtml || '<div class="reason">none</div>'}`;
+    <h3>Needs your review (${review.length}), not counted as bugs</h3>${reviewHtml || '<div class="reason">none</div>'}
+    ${duplicates.length ? `<h3>Already known (${duplicates.length}): found again, no new issue</h3>${duplicateHtml}` : ""}`;
 }
 
 // Sending tasks to Claude
@@ -505,6 +615,7 @@ async function pollRun() {
     state.groups = await api("/api/projects");
     renderSidebar();
     if (state.openTask) await showTask(state.openTask);
+    refreshIssueCount().catch(() => {});
   }
   if (state.run.active) pollRun.timer = setTimeout(() => pollRun().catch(() => {}), 2000);
 }
@@ -545,6 +656,7 @@ async function pollBatches() {
     state.groups = await api("/api/projects");
     renderSidebar();
     if (state.openTask) await showTask(state.openTask);
+    refreshIssueCount().catch(() => {});
   }
   const open = b.batches.some((x) => ["submitting", "in_progress", "canceling", "ended"].includes(x.status));
   if (open) pollBatches.timer = setTimeout(() => pollBatches().catch(() => {}), 30000);
@@ -604,6 +716,380 @@ async function refresh() {
   state.groups = await api("/api/projects");
   renderSidebar();
   if (state.openTask) await showTask(state.openTask);
+}
+
+// Findings and reproducing them
+
+const REPRO_ORDER = ["not_tried", "reproduced", "not_reproduced", "unable", "failed", "running"];
+const REPRO_LABELS = { not_tried: "not tried", reproduced: "reproduced", not_reproduced: "not reproduced",
+                       unable: "unable to reproduce", failed: "failed", running: "running", queued: "queued", waiting: "waiting" };
+const reproBadge = (s) => `<span class="badge ${esc(s)}">${esc(REPRO_LABELS[s] || s)}</span>`;
+const FIX_ORDER = ["not_tried", "fixed", "fix_rejected", "not_reproduced", "unable", "failed", "running"];
+const FIX_LABELS = { ...REPRO_LABELS, fixed: "fixed", fix_rejected: "fix rejected", unable: "unable" };
+const fixBadge = (s) => `<span class="badge ${esc(s)}">${esc(FIX_LABELS[s] || s)}</span>`;
+
+function queueBusy(q) {
+  const busy = new Map();
+  if (!q) return busy;
+  q.queued.forEach((f) => busy.set(f.id, "queued"));
+  q.waiting.forEach((f) => busy.set(f.id, "waiting"));
+  q.running.forEach((f) => busy.set(f.id, "running"));
+  return busy;
+}
+const canFix = (f, busy) => Boolean(f.issue_url) && !busy.has(f.id) && f.fix !== "running";
+
+async function showFindings() {
+  state.tab = "findings";
+  showTab();
+  renderSidebar();
+  writeHash();
+  if (!state.findings) $("f-rows").innerHTML = '<tr><td colspan="6" class="empty">Loading findings…</td></tr>';
+  await pollRepro();
+  await pollFix();
+  await loadFindings();
+}
+
+function reproBusy() {
+  const busy = new Map();
+  const r = state.repro;
+  if (!r) return busy;
+  r.queued.forEach((f) => busy.set(f.id, "queued"));
+  r.waiting.forEach((f) => busy.set(f.id, "waiting"));
+  r.running.forEach((f) => busy.set(f.id, "running"));
+  return busy;
+}
+
+const canSend = (f, busy) => Boolean(f.issue_url) && !busy.has(f.id) && f.reproduction !== "running";
+
+async function loadFindings() {
+  const data = await api("/api/findings");
+  state.findings = data;
+  const current = $("f-app").value;
+  $("f-app").innerHTML = '<option value="">All apps</option>' +
+    data.apps.map((a) => `<option value="${esc(a.key)}">${esc(a.label)} (${a.findings})</option>`).join("");
+  $("f-app").value = data.apps.some((a) => a.key === current) ? current : "";
+  renderFindings();
+  refreshPrCount().catch(() => {});
+  if (state.openFinding) await showFinding(state.openFinding);
+}
+
+function shownFindings(ignoreRepro = false) {
+  if (!state.findings) return [];
+  const needle = $("f-search").value.trim().toLowerCase();
+  return state.findings.findings.filter((f) =>
+    (!$("f-issue").checked || f.issue_url)
+    && (!$("f-app").value || f.app_key === $("f-app").value)
+    && (!$("f-severity").value || f.severity === $("f-severity").value)
+    && (!$("f-type").value || f.bug_type === $("f-type").value)
+    && (ignoreRepro || !$("f-repro").value || f.reproduction === $("f-repro").value)
+    && (!$("f-fix").value || f.fix === $("f-fix").value)
+    && (!needle || `${f.title} ${f.file_path}`.toLowerCase().includes(needle)));
+}
+
+function renderFindings() {
+  if (!state.findings) return;
+  const busy = reproBusy();
+  const base = shownFindings(true);
+  const counts = {};
+  base.forEach((f) => { counts[f.reproduction] = (counts[f.reproduction] || 0) + 1; });
+  const chosen = $("f-repro").value;
+  $("f-counts").innerHTML = `<span class="chip ${chosen ? "" : "active"}" data-repro="">All ${base.length}</span>` +
+    REPRO_ORDER.map((s) => `<span class="chip ${chosen === s ? "active" : ""}" data-repro="${s}">${REPRO_LABELS[s]} ${counts[s] || 0}</span>`).join("");
+  const rows = shownFindings();
+  const fixing = queueBusy(state.fix);
+  const sendable = new Set(rows.filter((f) => canSend(f, busy) || canFix(f, fixing)).map((f) => f.id));
+  for (const id of [...state.fSelected]) if (!sendable.has(id)) state.fSelected.delete(id);
+  $("f-rows").innerHTML = rows.length ? rows.map((f) => {
+    const shownState = busy.get(f.id) || f.reproduction;
+    const fixShown = fixing.get(f.id) || f.fix;
+    const action = !f.issue_url ? '<span class="reason">needs a GitHub issue</span>'
+      : (canSend(f, busy) ? `<button class="f-act" data-id="${f.id}">${f.attempts ? "Reproduce again" : "Reproduce"}</button>` : "") +
+        (canFix(f, fixing) ? ` <button class="fx-act" data-id="${f.id}" title="One agent: prove it with a test, then fix it">${f.fix === "not_tried" ? "Reproduce + fix" : "Fix again"}</button>` : "");
+    return `
+    <tr class="row ${state.openFinding === f.id ? "selected" : ""}" data-id="${f.id}">
+      <td><input type="checkbox" class="f-pick" data-id="${f.id}" ${state.fSelected.has(f.id) ? "checked" : ""} ${sendable.has(f.id) ? "" : "disabled"}></td>
+      <td><span class="sev ${esc(f.severity)}">${esc(f.severity)}</span></td>
+      <td><div class="title">${esc(f.title)}${f.possible_duplicate_of ? ` <span class="badge seen" title="Same file, within 3 lines, similar title. Only a hint: check it before reproducing or fixing both.">possible duplicate of #${f.possible_duplicate_of}</span>` : ""}</div>
+        <div class="reason">${typeBadge(f.app_type)} ${esc(f.app)} &middot; ${esc(f.bug_type)} &middot; <code>${esc(f.file_path)}:${f.line ?? ""}</code>
+          ${f.issue_url ? ` &middot; <a href="${esc(f.issue_url)}" target="_blank" rel="noopener">issue &#8599;</a>` : ""}</div></td>
+      <td style="white-space:nowrap">${reproBadge(shownState)}${f.cost_usd != null && !busy.has(f.id) ? ` <span class="reason">$${f.cost_usd.toFixed(2)}</span>` : ""}
+        ${f.attempts > 1 ? `<div class="reason">${f.attempts} attempts</div>` : ""}</td>
+      <td style="white-space:nowrap">${fixBadge(fixShown)}${f.fix_cost_usd != null && !fixing.has(f.id) ? ` <span class="reason">$${f.fix_cost_usd.toFixed(2)}</span>` : ""}
+        ${f.pr_url ? `<div><a href="${esc(f.pr_url)}" target="_blank" rel="noopener">draft PR &#8599;</a></div>` : ""}</td>
+      <td style="white-space:nowrap">${action}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="6" class="empty">${state.findings.findings.length ? "No findings match these filters." : "No findings yet. Send tasks to Claude on the Tasks tab first."}</td></tr>`;
+  updateFindingSelection(sendable);
+}
+
+function updateFindingSelection(sendable) {
+  $("f-selection").textContent = `${state.fSelected.size} selected`;
+  $("f-reproduce").disabled = $("fx-send").disabled = state.fSelected.size === 0;
+  $("f-select-all").checked = sendable.size > 0 && [...sendable].every((id) => state.fSelected.has(id));
+}
+
+function attemptHtml(a, latest) {
+  const total = a.input_tokens + a.cache_read_tokens + a.cache_write_tokens;
+  const stats = [`attempt #${a.id}`, esc(a.started_at), `${a.num_turns} turn${a.num_turns === 1 ? "" : "s"}`,
+    a.cost_usd != null ? `$${a.cost_usd.toFixed(2)}` : null,
+    total ? `${Math.round(a.cache_read_tokens * 100 / total)}% of input read from the cache` : null,
+    a.duration_ms ? `${Math.round(a.duration_ms / 1000)}s` : null].filter(Boolean).join(" &middot; ");
+  return `<div class="attempt">
+    <div>${reproBadge(a.status === "done" ? a.verdict : a.status)} <span class="reason">${stats}</span></div>
+    ${a.reason ? `<div class="why">${esc(a.reason)}</div>` : ""}
+    ${a.error ? `<div class="err">${esc(a.error)}</div>` : ""}
+    ${a.status === "failed" ? '<div class="reason">This attempt broke before reaching a verdict; send the finding again.</div>' : ""}
+    ${a.manual_steps ? `<h3>Manual steps for a person</h3><div class="why">${esc(a.manual_steps)}</div>` : ""}
+    ${a.conclusion ? `<div class="reason" style="margin-top:4px">Verifier's conclusion (not the verdict): ${esc(a.conclusion)}</div>` : ""}
+    ${a.test_code ? `<details ${latest ? "open" : ""}><summary>Test: ${esc(a.test_path)}${a.test_name ? ` &middot; ${esc(a.test_name)}` : ""}</summary><pre>${esc(a.test_code)}</pre></details>` : ""}
+    ${a.test_output ? `<details><summary>Output of the app's own run of the test</summary><pre>${esc(a.test_output)}</pre></details>` : ""}
+  </div>`;
+}
+
+async function showFinding(id) {
+  state.openFinding = id;
+  document.querySelectorAll("#f-rows tr.row").forEach((r) => r.classList.toggle("selected", Number(r.dataset.id) === id));
+  const d = await api(`/api/findings/${id}`);
+  const f = d.finding;
+  const busy = reproBusy();
+  const listed = state.findings?.findings.find((x) => x.id === id);
+  const sendable = listed && canSend(listed, busy);
+  const running = state.repro?.running.find((x) => x.id === id);
+  $("f-detail").innerHTML = `
+    <h2>${esc(f.title)}</h2>
+    <div class="reason"><span class="sev ${esc(f.severity)}">${esc(f.severity)}</span> ${esc(f.bug_type)} &middot; finding #${f.id}
+      from task #${f.task_id} &middot; ${esc(f.repo_name)}: <code>${esc(f.file_path)}:${f.line ?? ""}</code></div>
+    <div style="margin:6px 0">${f.issue_url ? `<a href="${esc(f.issue_url)}" target="_blank" rel="noopener">GitHub issue &#8599;</a>`
+      : '<span class="err">No GitHub issue yet. Create one on the Tasks tab (or with "Create missing GitHub issues") before reproducing.</span>'}</div>
+    <div class="claim">${f.evidence ? `<pre>${esc(f.evidence)}</pre>` : ""}<div>${esc(f.explanation)}</div></div>
+    <h3>Reproduction ${reproBadge(busy.get(id) || d.reproduction)}
+      ${sendable ? `<button class="primary f-act" data-id="${f.id}">${d.attempts.length ? "Reproduce again" : "Reproduce"}</button>` : ""}</h3>
+    ${running ? `<div class="reason">${running.log.map(esc).join("<br>") || "starting…"}</div>` : ""}
+    ${d.attempts.map((a, i) => attemptHtml(a, i === 0)).join("") || '<div class="reason">Not tried yet.</div>'}
+    ${fixSection(d, listed)}`;
+}
+
+function fixSection(d, listed) {
+  const fixing = queueBusy(state.fix);
+  const id = d.finding.id;
+  const running = state.fix?.running.find((x) => x.id === id);
+  const button = listed && canFix(listed, fixing)
+    ? `<button class="primary fx-act" data-id="${id}">${d.fixes.length ? "Fix again" : "Reproduce + fix"}</button>` : "";
+  return `
+    <h3>Reproduce + fix ${fixBadge(fixing.get(id) || d.fix)} ${button}</h3>
+    ${running ? `<div class="reason">${running.log.map(esc).join("<br>") || "starting…"}</div>` : ""}
+    ${d.fixes.map((a, i) => fixAttemptHtml(a, i === 0)).join("") || '<div class="reason">Not tried yet. One agent proves the bug with a test and, only if it is real, fixes it in a throwaway copy.</div>'}`;
+}
+
+function fixAttemptHtml(a, latest) {
+  const total = a.input_tokens + a.cache_read_tokens + a.cache_write_tokens;
+  const stats = [`fix attempt #${a.id}`, esc(a.started_at), `${a.num_turns} turn${a.num_turns === 1 ? "" : "s"}`,
+    a.cost_usd != null ? `$${a.cost_usd.toFixed(2)}` : null,
+    total ? `${Math.round(a.cache_read_tokens * 100 / total)}% of input read from the cache` : null,
+    a.duration_ms ? `${Math.round(a.duration_ms / 1000)}s` : null].filter(Boolean).join(" &middot; ");
+  const pr = a.pr_url
+    ? `<div style="margin:6px 0"><a href="${esc(a.pr_url)}" target="_blank" rel="noopener">Draft pull request &#8599;</a> <span class="reason">${esc(a.pr_branch)}</span></div>`
+    : a.status === "done" && a.outcome === "fixed"
+      ? `<div style="margin:6px 0"><button class="primary pr-btn" data-id="${a.id}">Open draft PR</button> <span class="reason">pushes a new audit/ branch and opens a draft pull request; asks you first</span></div>` : "";
+  return `<div class="attempt">
+    <div>${fixBadge(a.status === "done" ? a.outcome : a.status)} <span class="reason">${stats}</span></div>
+    ${a.reason ? `<div class="why">${esc(a.reason)}</div>` : ""}
+    ${a.error ? `<div class="err">${esc(a.error)}</div>` : ""}
+    ${a.status === "failed" ? '<div class="reason">This attempt broke before reaching an outcome; send the finding again.</div>' : ""}
+    ${a.manual_steps ? `<h3>Manual steps for a person</h3><div class="why">${esc(a.manual_steps)}</div>` : ""}
+    ${a.summary ? `<div style="margin-top:4px"><strong>The change:</strong> ${esc(a.summary)}</div>` : ""}
+    ${pr}
+    ${a.issue_comment_url ? `<div class="reason"><a href="${esc(a.issue_comment_url)}" target="_blank" rel="noopener">Comment on the issue &#8599;</a></div>` : ""}
+    ${a.patch ? `<details ${latest ? "open" : ""}><summary>Diff</summary><pre>${esc(a.patch)}</pre></details>` : ""}
+    ${a.test_code ? `<details><summary>Test: ${esc(a.test_path)}${a.test_name ? ` &middot; ${esc(a.test_name)}` : ""}</summary><pre>${esc(a.test_code)}</pre></details>` : ""}
+    ${a.before_output ? `<details><summary>App's run before the fix</summary><pre>${esc(a.before_output)}</pre></details>` : ""}
+    ${a.after_output ? `<details><summary>App's run with the fix</summary><pre>${esc(a.after_output)}</pre></details>` : ""}
+    ${a.related_output ? `<details><summary>Existing tests covering the changed files</summary><pre>${esc(a.related_output)}</pre></details>` : ""}
+  </div>`;
+}
+
+function renderFix() {
+  const q = state.fix;
+  if (!q) return;
+  if (document.activeElement !== $("fx-parallel")) $("fx-parallel").value = q.parallel;
+  $("fx-parallel").max = q.max_parallel;
+  const parts = [];
+  if (q.running.length) parts.push(`${q.running.length} running`);
+  if (q.queued.length) parts.push(`${q.queued.length} queued`);
+  if (q.waiting.length) parts.push(`${q.waiting.length} waiting on a rate limit`);
+  if (q.finished.length) parts.push(`${q.finished.length} finished this session`);
+  $("fx-summary").innerHTML = `<span class="reason">${esc(q.model)}${parts.length ? " &middot; " + esc(parts.join(", ")) : ""}</span>`;
+  $("fx-stop").hidden = !(q.queued.length || q.waiting.length);
+  const item = (f, badge, extra = "") => `<div class="item" data-id="${f.id}">${fixBadge(badge)}
+    <span class="t">#${f.id} ${esc(f.title)}</span>${extra}</div>`;
+  $("fx-run-detail").innerHTML = [
+    ...q.running.map((f) => item(f, "running", `<span class="reason">${esc(f.log[f.log.length - 1] || "starting…")}</span>`)),
+    ...q.waiting.map((f) => item(f, "waiting", `<span class="reason">${esc(f.reason)}</span>`)),
+    ...(q.queued.length ? [`<div class="reason">${q.queued.length} queued: ${q.queued.slice(0, 6).map((f) => `#${f.id}`).join(", ")}${q.queued.length > 6 ? "…" : ""}</div>`] : []),
+    ...q.finished.slice(0, 5).map((f) => f.status === "done"
+      ? item(f, f.verdict, f.cost_usd != null ? `<span class="reason">$${f.cost_usd.toFixed(2)}</span>` : "")
+      : item(f, "failed", `<span class="err">${esc((f.error || "").slice(0, 160))}</span>`)),
+  ].join("");
+}
+
+async function pollFix() {
+  clearTimeout(pollFix.timer);
+  const before = state.fix;
+  state.fix = await api("/api/fix");
+  renderFix();
+  const q = state.fix;
+  const changed = before && (before.finished.length !== q.finished.length || before.running.length !== q.running.length
+    || before.queued.length !== q.queued.length || before.active !== q.active);
+  if (changed) refreshPrCount().catch(() => {});
+  if (changed && state.tab === "findings") await loadFindings();
+  else if (state.tab === "findings" && state.openFinding && q.running.some((f) => f.id === state.openFinding)) await showFinding(state.openFinding);
+  if (q.active) pollFix.timer = setTimeout(() => pollFix().catch(() => {}), 2000);
+}
+
+async function sendFix(ids) {
+  if (!ids.length) return;
+  const q = state.fix || await api("/api/fix");
+  if (!q.runner.startsWith("Anthropic API")) {
+    return toast("Reproduce + fix needs an Anthropic API key: run audit-agent set-api-key, then restart the page server", true);
+  }
+  const parallel = Number($("fx-parallel").value) || 1;
+  const chosen = state.findings.findings.filter((f) => ids.includes(f.id));
+  const lines = chosen.slice(0, 10).map((f) => `• #${f.id} [${f.severity}] ${f.title}`).join("\n") +
+    (chosen.length > 10 ? `\n…and ${chosen.length - 10} more` : "");
+  const L = q.limits;
+  if (!confirm(`Reproduce and fix ${ids.length} finding${ids.length === 1 ? "" : "s"}?\n\n${lines}\n\n` +
+      `One agent per finding (${q.runner}, model ${q.model}, ${parallel} at a time). It writes a test; the app runs it on ` +
+      "the unchanged code, and only if it fails there may the agent change source files, in a throwaway copy. The app then " +
+      "checks that the test passes and the existing tests covering the change don't newly fail.\n\n" +
+      `Limits per finding: ${L.max_turns} turns, $${L.max_cost_usd.toFixed(2)}, ${Math.round(L.timeout_s / 60)} minutes ` +
+      `(at most $${(L.max_cost_usd * ids.length).toFixed(2)} in total).\n\n` +
+      "Nothing is written to your repository. If a fix is rejected or it can't be done, the finding's GitHub issue gets " +
+      "a comment saying why; pull requests are opened only by you.")) return;
+  const res = await api("/api/fix", { ids, parallel });
+  const skipped = res.skipped.length ? ` (${res.skipped.length} skipped: ${[...new Set(res.skipped.map((s) => s.reason))].join(", ")})` : "";
+  toast(`Sent ${res.queued.length} finding${res.queued.length === 1 ? "" : "s"} to reproduce and fix${skipped}`, res.skipped.length > 0 && !res.queued.length);
+  state.fSelected.clear();
+  state.fix = res.status;
+  renderFix();
+  await loadFindings();
+  pollFix().catch(() => {});
+}
+
+async function refreshPrCount() {
+  const plan = await api("/api/prs");
+  $("prs-all").hidden = plan.ready.length === 0;
+  $("prs-all").textContent = `Open all pending draft PRs (${plan.ready.length})`;
+  return plan;
+}
+
+async function openAllPrs() {
+  const plan = await refreshPrCount();
+  if (!plan.ready.length) return toast("No checked fix is waiting for a pull request");
+  const lines = plan.ready.slice(0, 15).map((p) => `• #${p.finding_id} ${p.title}\n   ${p.repo}: ${p.branch}`).join("\n") +
+    (plan.ready.length > 15 ? `\n…and ${plan.ready.length - 15} more` : "");
+  const notes = [...new Set(plan.ready.flatMap((p) => p.warnings))];
+  if (!confirm(`Open ${plan.ready.length} draft pull request${plan.ready.length === 1 ? "" : "s"}?\n\n${lines}\n\n` +
+      "Each pushes only its own new audit/ branch, opens a draft pull request that says \"Fixes\" its issue, and comments " +
+      "the link on the issue. Nothing is merged and no existing branch is touched. Only the changed files and the test " +
+      "are written, so this needs almost no disk space." +
+      (plan.blocked.length ? `\n\n${plan.blocked.length} can't be opened and will be skipped: ${plan.blocked[0].problems[0]}` : "") +
+      (notes.length ? `\n\nNote: ${notes[0]}` : ""))) return;
+  const button = $("prs-all");
+  button.disabled = true;
+  button.textContent = "Opening pull requests…";
+  try {
+    const res = await api("/api/prs", {});
+    toast(`Opened ${res.opened.length} draft pull request${res.opened.length === 1 ? "" : "s"}` +
+          (res.failed.length ? `; ${res.failed.length} failed: ${res.failed[0].error}` : "") +
+          (res.skipped.length ? `; ${res.skipped.length} skipped` : ""), res.failed.length > 0);
+  } finally {
+    button.disabled = false;
+    await loadFindings();
+  }
+}
+
+async function openPr(attemptId, button) {
+  const plan = await api(`/api/fixes/${attemptId}/pr`);
+  if (plan.problems.length) return toast(`Can't open a pull request: ${plan.problems[0]}`, true);
+  if (!confirm(`Open a draft pull request in ${plan.repo}?\n\n${plan.title}\n\n` +
+      `Branch: ${plan.branch} (new), based on ${plan.base} at ${plan.base_commit.slice(0, 12)}\n` +
+      `Files: ${plan.files.join(", ")}\n\n` +
+      "This pushes only that new branch, opens a draft pull request that says \"Fixes\" the finding's issue, and comments " +
+      "the link on the issue. Nothing is merged, " +
+      `and ${plan.base} isn't touched.` + (plan.warnings.length ? `\n\nNote: ${plan.warnings.join(" ")}` : ""))) return;
+  button.disabled = true;
+  button.textContent = "Opening…";
+  try {
+    const res = await api(`/api/fixes/${attemptId}/pr`, {});
+    toast(`Opened draft pull request ${res.url}` + (res.comment_url ? " and linked it on the issue" : "; commenting on the issue failed (see the server log)"),
+          !res.comment_url);
+  } finally {
+    await loadFindings();
+  }
+}
+
+function renderRepro() {
+  const r = state.repro;
+  if (!r) return;
+  if (document.activeElement !== $("f-parallel")) $("f-parallel").value = r.parallel;
+  $("f-parallel").max = r.max_parallel;
+  const parts = [];
+  if (r.running.length) parts.push(`${r.running.length} running`);
+  if (r.queued.length) parts.push(`${r.queued.length} queued`);
+  if (r.waiting.length) parts.push(`${r.waiting.length} waiting on a rate limit`);
+  if (r.finished.length) parts.push(`${r.finished.length} finished this session`);
+  $("f-summary").innerHTML = `<span class="reason">${esc(r.runner)} &middot; ${esc(r.model)}${parts.length ? " &middot; " + esc(parts.join(", ")) : ""}</span>`;
+  $("f-stop").hidden = !(r.queued.length || r.waiting.length);
+  const item = (f, badge, extra = "") => `<div class="item" data-id="${f.id}">${reproBadge(badge)}
+    <span class="t">#${f.id} ${esc(f.title)}</span>${extra}</div>`;
+  $("f-run-detail").innerHTML = [
+    ...r.running.map((f) => item(f, "running", `<span class="reason">${esc(f.log[f.log.length - 1] || "starting…")}</span>`)),
+    ...r.waiting.map((f) => item(f, "waiting", `<span class="reason">${esc(f.reason)}</span>`)),
+    ...(r.queued.length ? [`<div class="reason">${r.queued.length} queued: ${r.queued.slice(0, 6).map((f) => `#${f.id}`).join(", ")}${r.queued.length > 6 ? "…" : ""}</div>`] : []),
+    ...r.finished.slice(0, 5).map((f) => f.status === "done"
+      ? item(f, f.verdict, f.cost_usd != null ? `<span class="reason">$${f.cost_usd.toFixed(2)}</span>` : "")
+      : item(f, "failed", `<span class="err">${esc((f.error || "").slice(0, 160))}</span>`)),
+  ].join("");
+}
+
+async function pollRepro() {
+  clearTimeout(pollRepro.timer);
+  const before = state.repro;
+  state.repro = await api("/api/reproduce");
+  renderRepro();
+  const r = state.repro;
+  const changed = before && (before.finished.length !== r.finished.length || before.running.length !== r.running.length
+    || before.queued.length !== r.queued.length || before.active !== r.active);
+  if (changed && state.tab === "findings") await loadFindings();
+  else if (state.tab === "findings" && state.openFinding && r.running.some((f) => f.id === state.openFinding)) await showFinding(state.openFinding);
+  if (r.active) pollRepro.timer = setTimeout(() => pollRepro().catch(() => {}), 2000);
+}
+
+async function sendReproduce(ids) {
+  if (!ids.length) return;
+  const r = state.repro || await api("/api/reproduce");
+  if (!r.runner.startsWith("Anthropic API")) {
+    return toast("Reproducing needs an Anthropic API key: run audit-agent set-api-key, then restart the page server", true);
+  }
+  const parallel = Number($("f-parallel").value) || 1;
+  const chosen = state.findings.findings.filter((f) => ids.includes(f.id));
+  const lines = chosen.slice(0, 10).map((f) => `• #${f.id} [${f.severity}] ${f.title}`).join("\n") +
+    (chosen.length > 10 ? `\n…and ${chosen.length - 10} more` : "");
+  const L = r.limits;
+  if (!confirm(`Reproduce ${ids.length} finding${ids.length === 1 ? "" : "s"}?\n\n${lines}\n\n` +
+      `Runner: ${r.runner}, model ${r.model}, ${parallel} at a time.\n` +
+      `Limits per finding: ${L.max_turns} turns, $${L.max_cost_usd.toFixed(2)}, ${Math.round(L.timeout_s / 60)} minutes ` +
+      `(at most $${(L.max_cost_usd * ids.length).toFixed(2)} in total). Reaching a limit ends as "unable to reproduce".\n\n` +
+      "Each finding is a separate live Claude run billed to your API key. The first one for a repository also installs " +
+      "its dependencies into the test copy, which takes a minute or two.")) return;
+  const res = await api("/api/reproduce", { ids, parallel });
+  const skipped = res.skipped.length ? ` (${res.skipped.length} skipped: ${[...new Set(res.skipped.map((s) => s.reason))].join(", ")})` : "";
+  toast(`Sent ${res.queued.length} finding${res.queued.length === 1 ? "" : "s"} to reproduce${skipped}`, res.skipped.length > 0 && !res.queued.length);
+  state.fSelected.clear();
+  state.repro = res.status;
+  renderRepro();
+  await loadFindings();
+  pollRepro().catch(() => {});
 }
 
 // API map
@@ -702,13 +1188,16 @@ $("sidebar").addEventListener("click", (e) => {
   if (link) showApiMap(state.groups[Number(link.dataset.project)]);
 });
 $("tab-tasks").addEventListener("click", () => {
-  const app = state.app && state.project?.apps.some((a) => appKey(a) === appKey(state.app)) ? state.app : state.project?.apps[0];
-  if (app) selectApp(app, state.project);
+  const group = state.project || state.groups[0];
+  const app = state.app && group?.apps.some((a) => appKey(a) === appKey(state.app)) ? state.app : group?.apps[0];
+  if (app) selectApp(app, group);
 });
+$("tab-findings").addEventListener("click", () => showFindings());
 $("tab-api").addEventListener("click", () => { if (state.project?.id) showApiMap(state.project); });
+$("issues-all").addEventListener("click", () => createAllIssues());
 let typing;
 for (const id of ["folder", "search"]) $(id).addEventListener("input", () => { clearTimeout(typing); typing = setTimeout(loadTasks, 200); });
-for (const id of ["status", "tests", "kind"]) $(id).addEventListener("change", loadTasks);
+for (const id of ["status", "tests", "kind", "api-seen"]) $(id).addEventListener("change", loadTasks);
 $("status").innerHTML += STATUSES.map((s) => `<option value="${s}">${s}</option>`).join("");
 $("counts").addEventListener("click", (e) => {
   const chip = e.target.closest(".chip");
@@ -731,11 +1220,49 @@ $("rows").addEventListener("click", (e) => {
   if (row) showTask(Number(row.dataset.id));
 });
 $("detail").addEventListener("click", (e) => {
+  const open = e.target.closest(".open-task");
+  if (open) { e.preventDefault(); return showTask(Number(open.dataset.id)); }
   const act = e.target.closest(".act-detail");
   if (act) sendToClaude({ ids: [Number(act.dataset.id)] }, 1);
   const issues = e.target.closest(".issues-btn");
   if (issues) createIssues(Number(issues.dataset.id), issues);
 });
+
+async function refreshIssueCount() {
+  const plan = await api("/api/issues");
+  $("issues-all").hidden = plan.ready === 0;
+  $("issues-all").textContent = `Create missing GitHub issues (${plan.ready})`;
+  return plan;
+}
+
+async function createAllIssues() {
+  const plan = await refreshIssueCount();
+  if (!plan.ready) return toast("Every finding already has an issue");
+  const ready = plan.issues.filter((i) => !i.problem);
+  const byRepo = {};
+  ready.forEach((i) => { byRepo[i.repo] = (byRepo[i.repo] || 0) + 1; });
+  const shown = ready.slice(0, 12).map((i) => `• ${i.title}  (task #${i.task_id})`).join("\n");
+  if (!confirm(`Create ${ready.length} GitHub issue${ready.length === 1 ? "" : "s"}?\n\n` +
+      Object.entries(byRepo).map(([repo, n]) => `${n} in ${repo}`).join("\n") + "\n\n" + shown +
+      (ready.length > 12 ? `\n…and ${ready.length - 12} more` : "") +
+      `\n\nThey'll be added to: ${plan.boards.join(", ")} (public; created if missing).` +
+      (plan.blocked ? `\n\n${plan.blocked} can't be created (no GitHub remote) and will be skipped.` : ""))) return;
+  const button = $("issues-all");
+  button.disabled = true;
+  button.textContent = "Creating issues…";
+  try {
+    const res = await api("/api/issues", {});
+    const problems = res.errors.length + res.warnings.length;
+    toast(`Created ${res.created.length} issue${res.created.length === 1 ? "" : "s"}` +
+          (res.errors.length ? `; ${res.errors.length} task(s) failed: ${res.errors[0].error}` : "") +
+          (res.warnings.length ? `; ${res.warnings.length} warning(s)` : ""), problems > 0);
+  } finally {
+    button.disabled = false;
+    await refreshIssueCount();
+    await loadTasks();
+    if (state.openTask) await showTask(state.openTask);
+  }
+}
 
 async function createIssues(taskId, button) {
   const plan = await api(`/api/tasks/${taskId}/issues`);
@@ -757,6 +1284,7 @@ async function createIssues(taskId, button) {
   } finally {
     await loadTasks();
     await showTask(taskId);
+    refreshIssueCount().catch(() => {});
   }
 }
 $("run-detail").addEventListener("click", (e) => {
@@ -820,12 +1348,97 @@ $("select-all").addEventListener("change", (e) => {
   state.tasks.forEach((t) => e.target.checked ? state.selected.add(t.id) : state.selected.delete(t.id));
   loadTasks();
 });
+for (const id of ["f-issue", "f-app", "f-severity", "f-type", "f-repro", "f-fix"]) $(id).addEventListener("change", renderFindings);
+$("f-fix").innerHTML += FIX_ORDER.map((s) => `<option value="${s}">${FIX_LABELS[s]}</option>`).join("");
+$("fx-send").addEventListener("click", () => sendFix([...state.fSelected]));
+$("prs-all").addEventListener("click", () => openAllPrs());
+$("fx-run-detail").addEventListener("click", (e) => {
+  const item = e.target.closest(".item");
+  if (item) showFinding(Number(item.dataset.id));
+});
+$("fx-parallel").addEventListener("change", async () => {
+  const parallel = Number($("fx-parallel").value);
+  const max = state.fix?.max_parallel || 4;
+  if (!(parallel >= 1 && parallel <= max)) return toast(`Choose between 1 and ${max} at a time (each test run can use about 3 GB of memory)`);
+  state.fix = (await api("/api/fix", { ids: [], parallel })).status;
+  renderFix();
+});
+$("fx-stop").addEventListener("click", async () => {
+  if (!confirm("Drop the queued findings? Fixes already running will finish.")) return;
+  const res = await api("/api/fix/stop", {});
+  toast(`Dropped ${res.dropped} queued finding${res.dropped === 1 ? "" : "s"}`);
+  state.fix = res.status;
+  renderFix();
+  await loadFindings();
+});
+let typingFindings;
+$("f-search").addEventListener("input", () => { clearTimeout(typingFindings); typingFindings = setTimeout(renderFindings, 150); });
+$("f-repro").innerHTML += REPRO_ORDER.map((s) => `<option value="${s}">${REPRO_LABELS[s]}</option>`).join("");
+$("f-counts").addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  $("f-repro").value = chip.dataset.repro;
+  renderFindings();
+});
+$("f-rows").addEventListener("click", (e) => {
+  const pick = e.target.closest(".f-pick");
+  if (pick) {
+    const id = Number(pick.dataset.id);
+    pick.checked ? state.fSelected.add(id) : state.fSelected.delete(id);
+    return renderFindings();
+  }
+  const act = e.target.closest(".f-act");
+  if (act) return sendReproduce([Number(act.dataset.id)]);
+  const fixAct = e.target.closest(".fx-act");
+  if (fixAct) return sendFix([Number(fixAct.dataset.id)]);
+  if (e.target.closest("a")) return;
+  const row = e.target.closest("tr.row");
+  if (row) showFinding(Number(row.dataset.id));
+});
+$("f-detail").addEventListener("click", (e) => {
+  const act = e.target.closest(".f-act");
+  if (act) return sendReproduce([Number(act.dataset.id)]);
+  const fixAct = e.target.closest(".fx-act");
+  if (fixAct) return sendFix([Number(fixAct.dataset.id)]);
+  const pr = e.target.closest(".pr-btn");
+  if (pr) openPr(Number(pr.dataset.id), pr);
+});
+$("f-run-detail").addEventListener("click", (e) => {
+  const item = e.target.closest(".item");
+  if (item) showFinding(Number(item.dataset.id));
+});
+$("f-reproduce").addEventListener("click", () => sendReproduce([...state.fSelected]));
+$("f-select-all").addEventListener("change", (e) => {
+  const busy = reproBusy();
+  const fixing = queueBusy(state.fix);
+  shownFindings().filter((f) => canSend(f, busy) || canFix(f, fixing)).forEach((f) => e.target.checked ? state.fSelected.add(f.id) : state.fSelected.delete(f.id));
+  renderFindings();
+});
+$("f-parallel").addEventListener("change", async () => {
+  const parallel = Number($("f-parallel").value);
+  const max = state.repro?.max_parallel || 4;
+  if (!(parallel >= 1 && parallel <= max)) return toast(`Choose between 1 and ${max} at a time (each test run can use about 3 GB of memory)`);
+  state.repro = (await api("/api/reproduce", { ids: [], parallel })).status;
+  renderRepro();
+});
+$("f-stop").addEventListener("click", async () => {
+  if (!confirm("Drop the queued findings? Reproductions already running will finish.")) return;
+  const res = await api("/api/reproduce/stop", {});
+  toast(`Dropped ${res.dropped} queued finding${res.dropped === 1 ? "" : "s"}`);
+  state.repro = res.status;
+  renderRepro();
+  await loadFindings();
+});
 $("cancel-selected").addEventListener("click", () => change("cancel", [...state.selected]));
 $("restore-selected").addEventListener("click", () => change("restore", [...state.selected]));
 $("cancel-matching").addEventListener("click", () => changeMatching("cancel"));
 $("restore-matching").addEventListener("click", () => changeMatching("restore"));
 
 pollBatches().catch(() => {});
+refreshIssueCount().catch(() => {});
+pollRepro().catch(() => {});
+pollFix().catch(() => {});
+refreshPrCount().catch(() => {});
 pollRun()
   .catch((err) => {
     $("run-summary").innerHTML = `<span class="err">${esc(err.message)}</span>`;

@@ -238,7 +238,114 @@ def task_detail(conn: sqlite3.Connection, task_id: int) -> dict:
         **context,
         "findings": [dict(r) for r in store.list_findings(conn, task_id=task_id)],
         "runs": [dict(r) for r in store.task_runs(conn, task_id)],
+        "api_seen": api_seen(conn, task) if task["kind"] == "files" else None,
     }
+
+
+def api_seen(conn: sqlite3.Connection, task: sqlite3.Row) -> dict:
+    """Which of a file task's files finished API-call tasks already looked at, and what those tasks found in them."""
+    rows = conn.execute(
+        """SELECT tf.path, t.id AS api_task_id, t.title AS api_task_title, a.repo_name
+           FROM audit_task_files tf
+           JOIN api_task_files af ON af.audit_id = tf.audit_id AND af.path = tf.path
+           JOIN audit_tasks t ON t.id = af.task_id AND t.kind = 'api' AND t.status = 'done'
+           JOIN audits a ON a.id = t.audit_id
+           WHERE tf.task_id = ? ORDER BY tf.path, t.id""",
+        (task["id"],),
+    ).fetchall()
+    files: dict[str, list[dict]] = {}
+    for r in rows:
+        files.setdefault(r["path"], []).append({"id": r["api_task_id"], "title": r["api_task_title"], "repo": r["repo_name"]})
+    api_ids = sorted({r["api_task_id"] for r in rows})
+    found = []
+    if api_ids:
+        marks = ",".join("?" * len(api_ids))
+        paths = ",".join("?" * len(files))
+        found = [dict(r) for r in conn.execute(
+            f"""SELECT id, kind, severity, bug_type, title, file_path, line, issue_url, task_id FROM findings
+                WHERE task_id IN ({marks}) AND COALESCE(file_audit_id, audit_id) = ? AND file_path IN ({paths})
+                  AND duplicate_of IS NULL
+                ORDER BY kind, file_path, line""",
+            (*api_ids, task["audit_id"], *files),
+        )]
+    total = conn.execute("SELECT COUNT(*) FROM audit_task_files WHERE task_id = ?", (task["id"],)).fetchone()[0]
+    return {"files": [{"path": p, "api_tasks": t} for p, t in files.items()], "total_files": total, "findings": found}
+
+
+def reproduction_state(verification: sqlite3.Row | dict | None) -> str:
+    """not_tried, running, failed, or the verdict of the latest attempt."""
+    if verification is None:
+        return "not_tried"
+    if verification["status"] == "done":
+        return verification["verdict"]
+    return verification["status"]
+
+
+def fix_state(attempt: sqlite3.Row | dict | None) -> str:
+    """not_tried, running, failed, or the outcome of the latest "Reproduce + fix" attempt."""
+    if attempt is None:
+        return "not_tried"
+    return attempt["outcome"] if attempt["status"] == "done" else attempt["status"]
+
+
+def findings_overview(conn: sqlite3.Connection) -> dict:
+    """Every finding (not needs-review items) across tasks, with its app and its latest reproduction."""
+    rows = conn.execute(
+        """SELECT f.id, f.title, f.severity, f.bug_type, f.file_path, f.line, f.issue_url, f.task_id, f.possible_duplicate_of,
+                  a.id AS repo_audit_id, a.repo_name, inf.app_root, ap.app_type,
+                  v.id AS v_id, v.status AS v_status, v.verdict AS v_verdict, v.reason AS v_reason, v.cost_usd AS v_cost,
+                  (SELECT COUNT(*) FROM verifications x WHERE x.finding_id = f.id) AS attempts,
+                  fx.id AS fx_id, fx.status AS fx_status, fx.outcome AS fx_outcome, fx.cost_usd AS fx_cost, fx.pr_url AS fx_pr
+           FROM findings f
+           JOIN audits a ON a.id = COALESCE(f.file_audit_id, f.audit_id)
+           LEFT JOIN inventory_files inf ON inf.audit_id = a.id AND inf.path = f.file_path
+           LEFT JOIN inventory_apps ap ON ap.audit_id = a.id AND ap.root = inf.app_root
+           LEFT JOIN verifications v ON v.id = (SELECT MAX(id) FROM verifications y WHERE y.finding_id = f.id)
+           LEFT JOIN fix_attempts fx ON fx.id = (SELECT MAX(id) FROM fix_attempts z WHERE z.finding_id = f.id)
+           WHERE f.kind = 'finding' AND f.duplicate_of IS NULL
+           ORDER BY CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3
+                    ELSE 4 END, a.repo_name, f.file_path, f.line"""
+    ).fetchall()
+    apps: dict[str, dict] = {}
+    findings = []
+    for r in rows:
+        root = r["app_root"] or "."
+        key = f"{r['repo_audit_id']}:{root}"
+        apps.setdefault(key, {"key": key, "name": store.app_name(r["repo_name"], root), "audit_id": r["repo_audit_id"],
+                              "type": r["app_type"] or "unknown"})
+        latest = {"status": r["v_status"], "verdict": r["v_verdict"]} if r["v_id"] else None
+        findings.append({
+            "id": r["id"], "title": r["title"], "severity": r["severity"], "bug_type": r["bug_type"],
+            "file_path": r["file_path"], "line": r["line"], "issue_url": r["issue_url"], "task_id": r["task_id"],
+            "possible_duplicate_of": r["possible_duplicate_of"],
+            "app_key": key, "reproduction": reproduction_state(latest), "attempts": r["attempts"],
+            "reason": r["v_reason"], "cost_usd": r["v_cost"],
+            "fix": fix_state({"status": r["fx_status"], "outcome": r["fx_outcome"]} if r["fx_id"] else None),
+            "fix_cost_usd": r["fx_cost"], "pr_url": r["fx_pr"],
+        })
+    names = Counter(a["name"] for a in apps.values())
+    per_app = Counter(f["app_key"] for f in findings)
+    for app in apps.values():
+        app["label"] = app["name"] + (f" (audit {app['audit_id']})" if names[app["name"]] > 1 else "")
+        app["findings"] = per_app[app["key"]]
+    for f in findings:
+        f["app"] = apps[f["app_key"]]["label"]
+        f["app_type"] = apps[f["app_key"]]["type"]
+    return {"findings": findings, "apps": sorted(apps.values(), key=lambda a: a["label"])}
+
+
+def finding_detail(conn: sqlite3.Connection, finding_id: int) -> dict:
+    finding = dict(store.get_finding(conn, finding_id))
+    audit = store.get_audit(conn, finding["file_audit_id"] or finding["audit_id"])
+    attempts = [
+        {k: v for k, v in dict(row).items() if k != "transcript"}
+        for row in conn.execute("SELECT * FROM verifications WHERE finding_id = ? ORDER BY id DESC", (finding_id,))
+    ]
+    latest = attempts[0] if attempts else None
+    fixes = [{k: v for k, v in dict(row).items() if k not in ("transcript", "files")}
+             for row in store.list_fixes(conn, finding_id)]
+    return {"finding": {**finding, "repo_name": audit["repo_name"]}, "reproduction": reproduction_state(latest),
+            "attempts": attempts, "fix": fix_state(fixes[0] if fixes else None), "fixes": fixes}
 
 
 def _audit_apps(conn: sqlite3.Connection, audit: sqlite3.Row) -> list[dict]:

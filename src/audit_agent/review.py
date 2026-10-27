@@ -12,6 +12,8 @@ from audit_agent.inventory.languages import is_test_path
 
 CANCELLABLE_STATUSES = ("pending", "blocked", "failed")
 TEST_FILTERS = ("only", "hide")
+# File tasks by how many of their files a finished API-call task already looked at.
+API_FILTERS = ("all", "some", "none")
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,7 @@ class TaskFilter:
     search: str | None = None
     app: str | None = None
     kind: str | None = None
+    api: str | None = None
 
     def __post_init__(self) -> None:
         if self.status and self.status not in store.TASK_STATUSES:
@@ -30,6 +33,27 @@ class TaskFilter:
             raise ValueError(f"kind must be one of {store.TASK_KINDS}")
         if self.tests and self.tests not in TEST_FILTERS:
             raise ValueError(f"tests must be one of {TEST_FILTERS}")
+        if self.api and self.api not in API_FILTERS:
+            raise ValueError(f"api must be one of {API_FILTERS}")
+
+
+def api_coverage(conn: sqlite3.Connection, audit_id: int) -> dict[int, dict]:
+    """For each file task of the audit, which of its files a finished API-call task already looked at (from any
+    app of the project), and which API tasks those were. An API task reads a file to check one call, so this
+    means "looked at for that call", not that the whole file was audited."""
+    coverage: dict[int, dict] = {}
+    for row in conn.execute(
+        """SELECT tf.task_id, tf.path, af.task_id AS api_task_id
+           FROM audit_task_files tf
+           JOIN api_task_files af ON af.audit_id = tf.audit_id AND af.path = tf.path
+           JOIN audit_tasks t ON t.id = af.task_id AND t.kind = 'api' AND t.status = 'done'
+           WHERE tf.audit_id = ?""",
+        (audit_id,),
+    ):
+        entry = coverage.setdefault(row["task_id"], {"paths": set(), "api_task_ids": set()})
+        entry["paths"].add(row["path"])
+        entry["api_task_ids"].add(row["api_task_id"])
+    return coverage
 
 
 def _task_files(conn: sqlite3.Connection, audit_id: int) -> dict[int, list[str]]:
@@ -84,6 +108,13 @@ def _matches(task: dict, files: list[str], f: TaskFilter) -> bool:
         needle = f.search.lower()
         if needle not in task["title"].lower() and not any(needle in p.lower() for p in files):
             return False
+    if f.api:
+        if task["kind"] != "files":
+            return False
+        seen, total = task["api_covered"], len(files)
+        if (f.api == "all" and not (total and seen == total)) or (f.api == "some" and not 0 < seen < total) \
+                or (f.api == "none" and seen):
+            return False
     return True
 
 
@@ -92,6 +123,7 @@ def find_tasks(conn: sqlite3.Connection, audit_id: int, f: TaskFilter = TaskFilt
     store.get_audit(conn, audit_id)
     files = _task_files(conn, audit_id)
     apps = task_apps(conn, audit_id)
+    coverage = api_coverage(conn, audit_id)
     found = []
     for row in store.list_tasks(conn, audit_id):
         task = dict(row)
@@ -99,6 +131,9 @@ def find_tasks(conn: sqlite3.Connection, audit_id: int, f: TaskFilter = TaskFilt
         task["files"] = task_paths
         task["app_root"] = apps.get(task["id"])
         task["test_only"] = bool(task_paths) and all(is_test_path(p) for p in task_paths)
+        seen = coverage.get(task["id"]) if task["kind"] == "files" else None
+        task["api_covered"] = len(seen["paths"]) if seen else 0
+        task["api_task_ids"] = sorted(seen["api_task_ids"]) if seen else []
         if _matches(task, task_paths, f):
             found.append(task)
     return found

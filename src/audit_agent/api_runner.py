@@ -232,11 +232,14 @@ def http_request(method: str, url: str, api_key: str, body: dict | None = None, 
     raise InvestigationError("The Anthropic API kept failing after several retries.")
 
 
-def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+def estimate_cost(model: str, input_tokens: int, output_tokens: int, cache_write_tokens: int = 0,
+                  cache_read_tokens: int = 0) -> float | None:
+    """Estimated USD cost. Writing to the prompt cache costs 1.25x the input price and reading from it 0.1x."""
     price = PRICES.get(model)
     if price is None:
         return None
-    return (input_tokens * price[0] + output_tokens * price[1]) / 1_000_000
+    cached = cache_write_tokens * price[0] * 1.25 + cache_read_tokens * price[0] * 0.1
+    return (input_tokens * price[0] + output_tokens * price[1] + cached) / 1_000_000
 
 
 def run_api(

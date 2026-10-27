@@ -68,6 +68,8 @@ RESULT_SCHEMA = {
                     "line": {"type": "integer"},
                     "evidence": {"type": "string"},
                     "explanation": {"type": "string"},
+                    "duplicate_of": {"type": "integer", "description": "Number of the already known finding this "
+                                                                       "is the same bug as, if any"},
                 },
                 "required": ["title", "bug_type", "severity", "file", "line", "evidence", "explanation"],
             },
@@ -81,6 +83,7 @@ RESULT_SCHEMA = {
                     "suspicion": {"type": "string"},
                     "files_examined": {"type": "array", "items": {"type": "string"}},
                     "why_unconfirmed": {"type": "string"},
+                    "duplicate_of": {"type": "integer"},
                 },
                 "required": ["title", "suspicion", "why_unconfirmed"],
             },
@@ -226,6 +229,22 @@ Rules:
 """
 
 
+def known_section(conn: sqlite3.Connection, task_id: int) -> str:
+    """The findings already known in the task's files, so they aren't reported again."""
+    known = store.known_findings(conn, task_id)
+    if not known:
+        return ""
+    lines = []
+    for k in known:
+        label = f"{k['severity']} {k['bug_type']}" if k["kind"] == "finding" else "to review"
+        lines.append(f"  - #{k['id']} [{label}] {k['title']} ({k['repo_name']}: {k['file_path']}:{k['line'] or '?'})")
+    return (
+        "\nAlready known in these files (found earlier, possibly by another task). Don't report these again. Report "
+        "only problems that are not on this list, including a different bug at the same place. If something you "
+        "report is the same bug as one of these, set its duplicate_of to that number:\n" + "\n".join(lines)
+    )
+
+
 def _api_prompt(conn: sqlite3.Connection, task: sqlite3.Row, audit: sqlite3.Row, secrets: list[str]) -> str:
     detail = json.loads(task["detail"] or "{}")
     files = store.api_task_files(conn, task["id"])
@@ -268,6 +287,7 @@ def _api_prompt(conn: sqlite3.Connection, task: sqlite3.Row, audit: sqlite3.Row,
         + "\n".join(f"  - {s}" for s in secrets[:50]) if secrets else "",
         "\nCheck that both sides agree:\n" + API_CHECKLIST,
         problem,
+        known_section(conn, task["id"]),
         RULES.rstrip("\n")
         + "\n- Cite files in the main repository by their path relative to its root, and files in other repositories "
         "by their absolute path.\n\nReturn your result as JSON with \"findings\" and \"needs_review\" lists.",
@@ -323,6 +343,7 @@ def build_prompt(conn: sqlite3.Connection, task: sqlite3.Row, audit: sqlite3.Row
         ),
         section("Never open these files; they may contain secrets", secrets, 50),
         "\nLook for these kinds of bugs:\n" + CHECKLIST,
+        known_section(conn, task["id"]),
         """
 Rules:
 - Report only problems you can show in the code. For each finding, quote the exact code (1-10 lines, copied
@@ -417,6 +438,7 @@ def validate_report(report: dict, roots: dict[str, Path], secrets: set[Path]) ->
                     "explanation": explanation,
                     "why_unconfirmed": "The quoted code was not found in the cited file, so the claim couldn't be checked against the code.",
                     "files_examined": [rel],
+                    "duplicate_of": _number(item.get("duplicate_of")),
                 }
             )
             continue
@@ -430,6 +452,7 @@ def validate_report(report: dict, roots: dict[str, Path], secrets: set[Path]) ->
                 "line": actual,
                 "evidence": evidence,
                 "explanation": explanation,
+                "duplicate_of": _number(item.get("duplicate_of")),
             }
         )
     for item in report.get("needs_review") or []:
@@ -441,9 +464,41 @@ def validate_report(report: dict, roots: dict[str, Path], secrets: set[Path]) ->
                 "explanation": str(item.get("suspicion") or item.get("explanation") or "").strip(),
                 "why_unconfirmed": str(item.get("why_unconfirmed") or "").strip(),
                 "files_examined": [str(f) for f in item.get("files_examined") or []],
+                "duplicate_of": _number(item.get("duplicate_of")),
             }
         )
     return findings, needs_review, rejected
+
+
+def _number(value) -> int | None:
+    try:
+        return int(str(value).lstrip("#")) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2}
+
+
+def mark_duplicates(conn: sqlite3.Connection, task_id: int, items: list[dict]) -> None:
+    """Keep Claude's duplicate_of only when it names a finding the prompt listed for this task. Otherwise, add the
+    app's own hint (possible_duplicate_of) when a known finding is in the same file, within 3 lines, with a similar
+    title. The hint never hides anything; it is a label for the engineer."""
+    known = {k["id"]: k for k in store.known_findings(conn, task_id, limit=1000)}
+    for item in items:
+        if item.get("duplicate_of") not in known:
+            item["duplicate_of"] = None
+        if item["duplicate_of"] or not item.get("file_path"):
+            continue
+        words = _words(item["title"])
+        for k in known.values():
+            if (k["file_path"] == item["file_path"] and k["file_audit_id"] == item.get("file_audit_id")
+                    and abs((k["line"] or 0) - (item.get("line") or 0)) <= 3):
+                other = _words(k["title"])
+                if words and other and len(words & other) / len(words | other) >= 0.5:
+                    item["possible_duplicate_of"] = k["id"]
+                    break
 
 
 def _repo_state(root: Path) -> str:
@@ -542,6 +597,7 @@ def record_result(conn: sqlite3.Connection, run_id: int, scope: TaskScope, resul
     for item in findings + needs_review:
         if "repo_root" in item:
             item["file_audit_id"] = audit_of_root.get(item.pop("repo_root"))
+    mark_duplicates(conn, task_id, findings + needs_review)
     store.save_findings(conn, run_id, task_id, scope.audit["id"], GENERAL_AGENT, findings, needs_review)
     store.finish_run(
         conn, run_id, task_id, "done",
@@ -550,8 +606,9 @@ def record_result(conn: sqlite3.Connection, run_id: int, scope: TaskScope, resul
     )
     return {
         "run_id": run_id,
-        "findings": len(findings),
-        "needs_review": len(needs_review),
+        "findings": sum(1 for f in findings if not f.get("duplicate_of")),
+        "needs_review": sum(1 for n in needs_review if not n.get("duplicate_of")),
+        "duplicates": sum(1 for i in findings + needs_review if i.get("duplicate_of")),
         "rejected": rejected,
         "cost_usd": result.cost_usd,
         "duration_ms": result.duration_ms,

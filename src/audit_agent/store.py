@@ -12,7 +12,7 @@ from audit_agent.inventory.apps import APP_TYPES
 from audit_agent.inventory.models import Inventory
 from audit_agent.repo import GitRepository
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 16
 
 SCHEMA = """
 CREATE TABLE audits (
@@ -357,8 +357,99 @@ ALTER TABLE claude_batch_items_new RENAME TO claude_batch_items;
 CREATE INDEX claude_batch_items_task ON claude_batch_items (task_id, status);
 """
 
+VERIFICATION_STATUSES = ("running", "done", "failed")
+VERDICTS = ("reproduced", "not_reproduced", "unable")
+
+# One attempt to reproduce a finding with a test. 'failed' means the attempt itself broke (for example
+# the API was unreachable) and can be started again; 'done' always has a verdict.
+VERIFICATION_TABLES = f"""
+CREATE TABLE verifications (
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN {VERIFICATION_STATUSES}),
+    verdict TEXT CHECK (verdict IS NULL OR verdict IN {VERDICTS}),
+    reason TEXT,
+    manual_steps TEXT,
+    conclusion TEXT,
+    test_path TEXT,
+    test_name TEXT,
+    test_code TEXT,
+    test_output TEXT,
+    model TEXT NOT NULL,
+    num_turns INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    duration_ms INTEGER,
+    transcript TEXT,
+    error TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX verifications_finding ON verifications (finding_id);
+"""
+
+FIX_OUTCOMES = ("fixed", "fix_rejected", "not_reproduced", "unable")
+
+# One "Reproduce + fix" run of a finding. `files` holds, for each source file the fix changed, the hash
+# of the content it started from and the content after the fix, so a pull request can be made later.
+FIX_TABLES = f"""
+CREATE TABLE fix_attempts (
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN {VERIFICATION_STATUSES}),
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN {FIX_OUTCOMES}),
+    reason TEXT,
+    manual_steps TEXT,
+    summary TEXT,
+    test_path TEXT,
+    test_name TEXT,
+    test_code TEXT,
+    before_output TEXT,
+    after_output TEXT,
+    related_output TEXT,
+    patch TEXT,
+    files TEXT,
+    base_commit TEXT,
+    base_branch TEXT,
+    model TEXT NOT NULL,
+    num_turns INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    duration_ms INTEGER,
+    transcript TEXT,
+    error TEXT,
+    pr_url TEXT,
+    pr_branch TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX fix_attempts_finding ON fix_attempts (finding_id);
+"""
+
+# The comment a fix attempt posted on its finding's GitHub issue: the pull request link for a fix, or why
+# there is no fix for a rejected or unable attempt. Kept so a comment is never posted twice.
+FIX_COMMENT_TABLES = """
+ALTER TABLE fix_attempts ADD COLUMN issue_comment_url TEXT;
+"""
+
+# duplicate_of: the investigator said this is the same bug as an already known finding it was shown. Such
+# a finding gets no GitHub issue and isn't listed with the others. possible_duplicate_of: the app's own guess
+# (same file, nearby line, similar title); only a label for the engineer to check.
+DUPLICATE_TABLES = """
+ALTER TABLE findings ADD COLUMN duplicate_of INTEGER REFERENCES findings(id) ON DELETE SET NULL;
+ALTER TABLE findings ADD COLUMN possible_duplicate_of INTEGER REFERENCES findings(id) ON DELETE SET NULL;
+"""
+
 SCHEMA += (TASK_TABLES + API_TABLES + API_TRACE_TABLES + FINDING_TABLES + APP_TABLES + API_TASK_TABLES + BATCH_TABLES
-           + ISSUE_TABLES + BATCH_ROUND_TABLES)
+           + ISSUE_TABLES + BATCH_ROUND_TABLES + VERIFICATION_TABLES + FIX_TABLES + FIX_COMMENT_TABLES + DUPLICATE_TABLES)
 
 SECTIONS = {
     "files": ("inventory_files", "path"),
@@ -403,6 +494,10 @@ MIGRATIONS = {
     9: BATCH_TABLES,
     10: ISSUE_TABLES,
     11: BATCH_ROUND_TABLES,
+    12: VERIFICATION_TABLES,
+    13: FIX_TABLES,
+    14: FIX_COMMENT_TABLES,
+    15: DUPLICATE_TABLES,
 }
 
 
@@ -1038,20 +1133,22 @@ def save_findings(
     now = _now()
     rows = [
         (task_id, run_id, audit_id, agent, "finding", f["bug_type"], f["severity"], f["title"], f["file_path"],
-         f["line"], f["evidence"], f["explanation"], None, None, f.get("file_audit_id"), now)
+         f["line"], f["evidence"], f["explanation"], None, None, f.get("file_audit_id"), f.get("duplicate_of"),
+         f.get("possible_duplicate_of"), now)
         for f in findings
     ] + [
         (task_id, run_id, audit_id, agent, "needs_review", n.get("bug_type"), None, n["title"], n.get("file_path"),
          n.get("line"), n.get("evidence"), n["explanation"], n.get("why_unconfirmed"),
-         json.dumps(n.get("files_examined") or []), n.get("file_audit_id"), now)
+         json.dumps(n.get("files_examined") or []), n.get("file_audit_id"), n.get("duplicate_of"),
+         n.get("possible_duplicate_of"), now)
         for n in needs_review
     ]
     with conn:
         conn.executemany(
             """INSERT INTO findings (task_id, run_id, audit_id, agent, kind, bug_type, severity, title, file_path,
                                      line, evidence, explanation, why_unconfirmed, files_examined, file_audit_id,
-                                     created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                     duplicate_of, possible_duplicate_of, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
@@ -1075,6 +1172,186 @@ def list_findings(conn: sqlite3.Connection, *, audit_id: int | None = None, task
     sql += """ ORDER BY f.kind, CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
                WHEN 'low' THEN 3 ELSE 4 END, f.file_path, f.line"""
     return conn.execute(sql, params).fetchall()
+
+
+def known_findings(conn: sqlite3.Connection, task_id: int, limit: int = 60) -> list[sqlite3.Row]:
+    """Findings and review items already saved (by any task) that cite one of this task's files, most severe
+    first; duplicates point to these instead of being listed themselves."""
+    task = get_task(conn, task_id)
+    if task["kind"] == "api":
+        files = "SELECT audit_id, path FROM api_task_files WHERE task_id = :task"
+    else:
+        files = "SELECT audit_id, path FROM audit_task_files WHERE task_id = :task"
+    return conn.execute(
+        f"""SELECT f.id, f.kind, f.severity, f.bug_type, f.title, f.file_path, f.line, a.repo_name,
+                   a.id AS file_audit_id
+            FROM findings f JOIN audits a ON a.id = COALESCE(f.file_audit_id, f.audit_id)
+            WHERE f.duplicate_of IS NULL
+              AND (COALESCE(f.file_audit_id, f.audit_id), f.file_path) IN ({files})
+            ORDER BY f.kind, CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                     WHEN 'low' THEN 3 ELSE 4 END, f.file_path, f.line
+            LIMIT :limit""",
+        {"task": task_id, "limit": limit},
+    ).fetchall()
+
+
+def get_finding(conn: sqlite3.Connection, finding_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        """SELECT f.*, t.title AS task_title, t.kind AS task_kind FROM findings f
+           JOIN audit_tasks t ON t.id = f.task_id WHERE f.id = ?""",
+        (finding_id,),
+    ).fetchone()
+    if row is None:
+        raise StoreError(f"No finding with id {finding_id}")
+    return row
+
+
+def start_verification(conn: sqlite3.Connection, finding_id: int, model: str) -> int:
+    """Record a new verification of the finding. Refused while another one of it is running."""
+    with conn:
+        cursor = conn.execute(
+            """INSERT INTO verifications (finding_id, status, model, started_at)
+               SELECT ?, 'running', ?, ? WHERE NOT EXISTS
+                   (SELECT 1 FROM verifications WHERE finding_id = ? AND status = 'running')""",
+            (finding_id, model, _now(), finding_id),
+        )
+    if not cursor.rowcount:
+        raise StoreError(f"Finding {finding_id} is already being reproduced.")
+    return cursor.lastrowid
+
+
+VERIFICATION_FIELDS = {
+    "status", "verdict", "reason", "manual_steps", "conclusion", "test_path", "test_name", "test_code", "test_output",
+    "num_turns", "input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens", "cost_usd",
+    "duration_ms", "transcript", "error",
+}
+
+
+def finish_verification(conn: sqlite3.Connection, verification_id: int, status: str, **fields) -> None:
+    if status not in ("done", "failed"):
+        raise ValueError(f"a verification finishes as done or failed, not {status}")
+    if unknown := set[str](fields) - VERIFICATION_FIELDS:
+        raise ValueError(f"unknown verification fields {unknown}")
+    if status == "done" and fields.get("verdict") not in VERDICTS:
+        raise ValueError("a finished verification needs a verdict")
+    fields = {"status": status, **fields, "finished_at": _now()}
+    with conn:
+        conn.execute(
+            f"UPDATE verifications SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+            (*fields.values(), verification_id),
+        )
+
+
+def get_verification(conn: sqlite3.Connection, verification_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM verifications WHERE id = ?", (verification_id,)).fetchone()
+    if row is None:
+        raise StoreError(f"No verification with id {verification_id}")
+    return row
+
+
+def list_verifications(conn: sqlite3.Connection, *, finding_id: int | None = None,
+                       audit_id: int | None = None) -> list[sqlite3.Row]:
+    sql = """SELECT v.id, v.finding_id, v.status, v.verdict, v.reason, v.test_path, v.model, v.num_turns,
+                    v.cost_usd, v.duration_ms, v.error, v.started_at, v.finished_at, f.title, f.audit_id
+             FROM verifications v JOIN findings f ON f.id = v.finding_id WHERE 1 = 1"""
+    params: list = []
+    if finding_id is not None:
+        sql += " AND v.finding_id = ?"
+        params.append(finding_id)
+    if audit_id is not None:
+        sql += " AND f.audit_id = ?"
+        params.append(audit_id)
+    return conn.execute(sql + " ORDER BY v.id", params).fetchall()
+
+
+def fail_interrupted_verifications(conn: sqlite3.Connection) -> int:
+    """Mark verifications left 'running' by a process that stopped as failed, so they can be started again."""
+    with conn:
+        return conn.execute(
+            """UPDATE verifications SET status = 'failed', finished_at = ?,
+                   error = 'Interrupted: the process reproducing this finding stopped before it finished.'
+               WHERE status = 'running'""",
+            (_now(),),
+        ).rowcount
+
+
+def start_fix(conn: sqlite3.Connection, finding_id: int, model: str, base_commit: str | None,
+              base_branch: str | None) -> int:
+    """Record a new "Reproduce + fix" run of the finding. Refused while another one of it is running."""
+    with conn:
+        cursor = conn.execute(
+            """INSERT INTO fix_attempts (finding_id, status, model, base_commit, base_branch, started_at)
+               SELECT ?, 'running', ?, ?, ?, ? WHERE NOT EXISTS
+                   (SELECT 1 FROM fix_attempts WHERE finding_id = ? AND status = 'running')""",
+            (finding_id, model, base_commit, base_branch, _now(), finding_id),
+        )
+    if not cursor.rowcount:
+        raise StoreError(f"Finding {finding_id} is already being fixed.")
+    return cursor.lastrowid
+
+
+FIX_FIELDS = {
+    "status", "outcome", "reason", "manual_steps", "summary", "test_path", "test_name", "test_code", "before_output",
+    "after_output", "related_output", "patch", "files", "num_turns", "input_tokens", "output_tokens",
+    "cache_write_tokens", "cache_read_tokens", "cost_usd", "duration_ms", "transcript", "error",
+}
+
+
+def finish_fix(conn: sqlite3.Connection, attempt_id: int, status: str, **fields) -> None:
+    if status not in ("done", "failed"):
+        raise ValueError(f"a fix attempt finishes as done or failed, not {status}")
+    if unknown := set(fields) - FIX_FIELDS:
+        raise ValueError(f"unknown fix attempt fields {unknown}")
+    if status == "done" and fields.get("outcome") not in FIX_OUTCOMES:
+        raise ValueError("a finished fix attempt needs an outcome")
+    fields = {"status": status, **fields, "finished_at": _now()}
+    with conn:
+        conn.execute(
+            f"UPDATE fix_attempts SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+            (*fields.values(), attempt_id),
+        )
+
+
+def get_fix(conn: sqlite3.Connection, attempt_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM fix_attempts WHERE id = ?", (attempt_id,)).fetchone()
+    if row is None:
+        raise StoreError(f"No fix attempt with id {attempt_id}")
+    return row
+
+
+def list_fixes(conn: sqlite3.Connection, finding_id: int) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM fix_attempts WHERE finding_id = ? ORDER BY id DESC", (finding_id,)).fetchall()
+
+
+def set_fix_pr(conn: sqlite3.Connection, attempt_id: int, url: str, branch: str) -> None:
+    with conn:
+        conn.execute("UPDATE fix_attempts SET pr_url = ?, pr_branch = ? WHERE id = ?", (url, branch, attempt_id))
+
+
+def set_fix_comment(conn: sqlite3.Connection, attempt_id: int, url: str) -> None:
+    with conn:
+        conn.execute("UPDATE fix_attempts SET issue_comment_url = ? WHERE id = ?", (url, attempt_id))
+
+
+def fixes_missing_comments(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Finished fix attempts whose issue should have a comment and doesn't yet: a pull request was
+    opened, or the fix was rejected, or the finding couldn't be reproduced or fixed here."""
+    return conn.execute(
+        """SELECT a.* FROM fix_attempts a JOIN findings f ON f.id = a.finding_id
+           WHERE a.status = 'done' AND a.issue_comment_url IS NULL AND f.issue_url IS NOT NULL
+             AND (a.pr_url IS NOT NULL OR a.outcome IN ('fix_rejected', 'unable'))
+           ORDER BY a.id"""
+    ).fetchall()
+
+
+def fail_interrupted_fixes(conn: sqlite3.Connection) -> int:
+    with conn:
+        return conn.execute(
+            """UPDATE fix_attempts SET status = 'failed', finished_at = ?,
+                   error = 'Interrupted: the process fixing this finding stopped before it finished.'
+               WHERE status = 'running'""",
+            (_now(),),
+        ).rowcount
 
 
 def set_finding_issue(conn: sqlite3.Connection, finding_id: int, url: str) -> None:
